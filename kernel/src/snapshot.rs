@@ -243,6 +243,10 @@ impl Snapshot {
     pub fn protocol(&self) -> &Protocol {
         &self.protocol
     }
+
+    pub fn location(&self) -> &Url {
+        &self.table_root
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

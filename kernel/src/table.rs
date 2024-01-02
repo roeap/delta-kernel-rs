@@ -23,7 +23,10 @@ impl std::fmt::Debug for Table {
 
 impl Table {
     /// Create a new Delta table with the given parameters
-    pub fn new(location: Url) -> Self {
+    pub fn new(mut location: Url) -> Self {
+        if !location.path().ends_with("/") {
+            location.set_path(&format!("{}/", location.path()));
+        }
         Self { location }
     }
 

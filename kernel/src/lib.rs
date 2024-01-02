@@ -195,7 +195,7 @@ pub trait ParquetHandler: Send + Sync {
 /// Interface encapsulating all clients needed by the Delta Kernel in order to read the Delta table.
 ///
 /// Connectors are expected to pass an implementation of this interface when reading a Delta table.
-pub trait TableClient {
+pub trait TableClient: Send + Sync {
     /// Get the connector provided [`ExpressionHandler`].
     fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler>;
 

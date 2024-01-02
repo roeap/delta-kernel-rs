@@ -15,7 +15,6 @@ use crate::{Add, DeltaResult, Error, FileMeta, TableClient};
 mod data_skipping;
 pub mod file_stream;
 
-// TODO projection: something like fn select(self, columns: &[&str])
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: Arc<Snapshot>,
@@ -89,6 +88,7 @@ pub struct Scan {
 impl std::fmt::Debug for Scan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Scan")
+            .field("snapshot", &self.snapshot)
             .field("schema", &self.read_schema)
             .field("predicate", &self.predicate)
             .finish()
@@ -115,6 +115,11 @@ impl Scan {
     /// Get the predicate [`Expression`] of the scan.
     pub fn predicate(&self) -> &Option<Expression> {
         &self.predicate
+    }
+
+    /// Get the [`Snapshot`] of the scan.
+    pub fn snapshot(&self) -> &Arc<Snapshot> {
+        &self.snapshot
     }
 
     /// This is the main method to 'materialize' the scan. It returns a `ScanFileBatchIterator`
