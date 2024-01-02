@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, ListArray, MapArray, StructArray};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields};
+use tracing::debug;
 
 use super::{LIST_ROOT_DEFAULT, MAP_KEY_DEFAULT, MAP_ROOT_DEFAULT, MAP_VALUE_DEFAULT};
 
@@ -152,7 +153,12 @@ impl FieldsExt for Fields {
             let d: ArrayRef = match v {
                 List(child) => {
                     let list_arr = pick(path, f)?;
-                    let list_arr = list_arr.as_any().downcast_ref::<ListArray>().unwrap();
+                    let list_arr = list_arr.as_any().downcast_ref::<ListArray>().ok_or(
+                        ArrowError::SchemaError(format!(
+                            "Expected ListArray, found: {}",
+                            list_arr.data_type()
+                        )),
+                    )?;
                     let items = pick_array(child, visit, pick, path)?;
                     Arc::new(ListArray::try_new(
                         child.clone(),
@@ -174,7 +180,12 @@ impl FieldsExt for Fields {
                         .clone();
 
                     let map_arr = pick(path, f)?;
-                    let map_arr = map_arr.as_any().downcast_ref::<MapArray>().unwrap();
+                    let map_arr = map_arr.as_any().downcast_ref::<MapArray>().ok_or(
+                        ArrowError::SchemaError(format!(
+                            "Expected MapArray, found: {}",
+                            map_arr.data_type()
+                        )),
+                    )?;
 
                     Arc::new(MapArray::try_new(
                         Arc::new(Field::new(
@@ -195,7 +206,13 @@ impl FieldsExt for Fields {
                 Struct(fields) => {
                     let struct_arr = pick(path, f)?;
                     if matches!(path.scope(), Some(ArrayScope::Map)) {
-                        let map_arr = struct_arr.as_any().downcast_ref::<MapArray>().unwrap();
+                        debug!("pick map struct: {} / {}", f.name(), path.names().join("."));
+                        let map_arr = struct_arr.as_any().downcast_ref::<MapArray>().ok_or(
+                            ArrowError::SchemaError(format!(
+                                "Expected MapArray, found: {}",
+                                struct_arr.data_type()
+                            )),
+                        )?;
                         Arc::new(map_arr.entries().clone())
                     } else {
                         let arrays: Vec<_> = fields
