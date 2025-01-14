@@ -93,10 +93,19 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         // `filesystem.rs`
         let store_str = format!("{}", store);
         let is_local = store_str.starts_with("LocalFileSystem");
+        Self::new_with_opts(store, table_root, task_executor, !is_local)
+    }
+
+    pub fn new_with_opts(
+        store: Arc<DynObjectStore>,
+        table_root: Path,
+        task_executor: Arc<E>,
+        has_ordered_listing: bool,
+    ) -> Self {
         Self {
             file_system: Arc::new(ObjectStoreFileSystemClient::new(
                 store.clone(),
-                !is_local,
+                has_ordered_listing,
                 table_root,
                 task_executor.clone(),
             )),
