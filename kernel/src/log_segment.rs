@@ -181,6 +181,34 @@ impl LogSegment {
         );
         LogSegment::try_new(ascending_commit_files, vec![], log_root, end_version)
     }
+
+    pub(crate) fn extend(&mut self, other: &LogSegment) -> DeltaResult<()> {
+        if self.log_root != other.log_root {
+            return Err(Error::generic(
+                "Cannot merge LogSegments with different log roots",
+            ));
+        }
+        if other.ascending_commit_files.is_empty() {
+            return Ok(());
+        }
+        if self.end_version + 1 != other.ascending_commit_files.first().unwrap().version {
+            return Err(Error::generic(
+                "Cannot merge LogSegments with a gap between them",
+            ));
+        }
+        if !other.checkpoint_parts.is_empty() {
+            return Err(Error::generic(
+                "Cannot merge LogSegments with checkpoint parts",
+            ));
+        }
+
+        self.ascending_commit_files
+            .extend(other.ascending_commit_files.iter().cloned());
+        self.end_version = other.end_version;
+
+        Ok(())
+    }
+
     /// Read a stream of log data from this log segment.
     ///
     /// The log files will be read from most recent to oldest.
@@ -227,7 +255,10 @@ impl LogSegment {
     }
 
     // Get the most up-to-date Protocol and Metadata actions
-    pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
+    pub(crate) fn read_metadata_opt(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         let data_batches = self.replay_for_metadata(engine)?;
         let (mut metadata_opt, mut protocol_opt) = (None, None);
         for batch in data_batches {
@@ -243,7 +274,11 @@ impl LogSegment {
                 break;
             }
         }
-        match (metadata_opt, protocol_opt) {
+        Ok((metadata_opt, protocol_opt))
+    }
+
+    pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
+        match self.read_metadata_opt(engine)? {
             (Some(m), Some(p)) => Ok((m, p)),
             (None, Some(_)) => Err(Error::MissingMetadata),
             (Some(_), None) => Err(Error::MissingProtocol),

@@ -21,6 +21,7 @@ use arrow_schema::{
 };
 use arrow_select::concat::concat;
 use itertools::Itertools;
+use parquet::arrow::async_writer::AsyncFileWriter;
 
 use super::arrow_conversion::LIST_ARRAY_ROOT;
 use super::arrow_utils::make_arrow_error;
@@ -137,6 +138,7 @@ fn wrap_comparison_result(arr: BooleanArray) -> ArrayRef {
     Arc::new(arr) as _
 }
 
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 trait ProvidesColumnByName {
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
 }
@@ -153,30 +155,34 @@ impl ProvidesColumnByName for StructArray {
     }
 }
 
-// Given a RecordBatch or StructArray, recursively probe for a nested column path and return the
-// corresponding column, or Err if the path is invalid. For example, given the following schema:
-// ```text
-// root: {
-//   a: int32,
-//   b: struct {
-//     c: int32,
-//     d: struct {
-//       e: int32,
-//       f: int64,
-//     },
-//   },
-// }
-// ```
-// The path ["b", "d", "f"] would retrieve the int64 column while ["a", "b"] would produce an error.
-fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> DeltaResult<ArrayRef> {
+/// Given a RecordBatch or StructArray, recursively probe for a nested column path and return the
+/// corresponding column, or Err if the path is invalid. For example, given the following schema:
+/// ```text
+/// root: {
+///   a: int32,
+///   b: struct {
+///     c: int32,
+///     d: struct {
+///       e: int32,
+///       f: int64,
+///     },
+///   },
+/// }
+/// ```
+/// The path ["b", "d", "f"] would retrieve the int64 column while ["a", "b"] would produce an error.
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+fn extract_column(
+    mut parent: &dyn ProvidesColumnByName,
+    col: &[impl AsRef<str>],
+) -> DeltaResult<ArrayRef> {
     let mut field_names = col.iter();
     let Some(mut field_name) = field_names.next() else {
         return Err(ArrowError::SchemaError("Empty column path".to_string()))?;
     };
     loop {
-        let child = parent
-            .column_by_name(field_name)
-            .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {field_name}")))?;
+        let child = parent.column_by_name(field_name.as_ref()).ok_or_else(|| {
+            ArrowError::SchemaError(format!("No such field: {}", field_name.as_ref()))
+        })?;
         field_name = match field_names.next() {
             Some(name) => name,
             None => return Ok(child.clone()),
@@ -184,10 +190,13 @@ fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> Delt
         parent = child
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| ArrowError::SchemaError(format!("Not a struct: {field_name}")))?;
+            .ok_or_else(|| {
+                ArrowError::SchemaError(format!("Not a struct: {}", field_name.as_ref()))
+            })?;
     }
 }
 
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 fn evaluate_expression(
     expression: &Expression,
     batch: &RecordBatch,
@@ -455,8 +464,8 @@ fn new_field_with_metadata(
 
 // A helper that is a wrapper over `transform_field_and_col`. This will take apart the passed struct
 // and use that method to transform each column and then put the struct back together. Target types
-// and names for each column should be passed in `target_types_and_names`. The number of elements in
-// the `target_types_and_names` iterator _must_ be the same as the number of columns in
+// and names for each column should be passed in `target_fields`. The number of elements in
+// the `target_fields` iterator _must_ be the same as the number of columns in
 // `struct_array`. The transformation is ordinal. That is, the order of fields in `target_fields`
 // _must_ match the order of the columns in `struct_array`.
 fn transform_struct(
@@ -498,9 +507,10 @@ fn transform_struct(
 // Transform a struct array. The data is in `array`, and the target fields are in `kernel_fields`.
 fn apply_schema_to_struct(array: &dyn Array, kernel_fields: &Schema) -> DeltaResult<StructArray> {
     let Some(sa) = array.as_struct_opt() else {
-        return Err(make_arrow_error(
-            "Arrow claimed to be a struct but isn't a StructArray",
-        ));
+        return Err(make_arrow_error(format!(
+            "Arrow claimed to be a struct but isn't a StructArray. Found: {}",
+            array.data_type()
+        )));
     };
     transform_struct(sa, kernel_fields.fields())
 }

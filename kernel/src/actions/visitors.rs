@@ -174,6 +174,10 @@ pub(crate) struct AddVisitor {
 }
 
 impl AddVisitor {
+    pub fn new() -> Self {
+        Self { adds: Vec::new() }
+    }
+
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     #[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
     fn visit_add<'a>(
@@ -318,8 +322,7 @@ impl RowVisitor for RemoveVisitor {
 #[allow(unused)]
 #[derive(Default)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-struct CdcVisitor {
+pub(crate) struct CdcVisitor {
     pub(crate) cdcs: Vec<Cdc>,
 }
 
@@ -377,7 +380,6 @@ pub type SetTransactionMap = HashMap<String, SetTransaction>;
 ///
 #[derive(Default, Debug)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
 pub(crate) struct SetTransactionVisitor {
     pub(crate) set_transactions: SetTransactionMap,
     pub(crate) application_id: Option<String>,

@@ -618,8 +618,7 @@ pub(crate) fn parse_json(
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
     let json_strings = json_strings
         .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
+        .as_string_opt::<i32>()
         .ok_or_else(|| {
             Error::generic("Expected json_strings to be a StringArray, found something else")
         })?;

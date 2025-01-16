@@ -59,7 +59,7 @@ impl Snapshot {
     pub fn try_new(
         table_root: Url,
         engine: &dyn Engine,
-        version: Option<Version>,
+        version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
         let fs_client = engine.get_file_system_client();
         let log_root = table_root.join("_delta_log/")?;
@@ -99,6 +99,43 @@ impl Snapshot {
             table_properties,
             column_mapping_mode,
         })
+    }
+
+    pub fn update(
+        &mut self,
+        target_version: impl Into<Option<Version>>,
+        engine: &dyn Engine,
+    ) -> DeltaResult<()> {
+        let fs_client = engine.get_file_system_client();
+        let log_root = self.table_root.join("_delta_log/")?;
+        let log_segment = LogSegment::for_table_changes(
+            fs_client.as_ref(),
+            log_root,
+            self.version() + 1,
+            target_version,
+        )?;
+
+        let (metadata, protocol) = log_segment.read_metadata_opt(engine)?;
+
+        if let Some(p) = protocol {
+            // important! before a read/write to the table we must check it is supported
+            p.ensure_read_supported()?;
+            self.protocol = p;
+        }
+
+        if let Some(m) = metadata {
+            let schema = m.parse_schema()?;
+            let table_properties = m.parse_table_properties();
+            let column_mapping_mode = column_mapping_mode(&self.protocol, &table_properties);
+            validate_schema_column_mapping(&schema, column_mapping_mode)?;
+            self.metadata = m;
+            self.schema = schema;
+            self.table_properties = table_properties;
+        }
+
+        self.log_segment.extend(&log_segment)?;
+
+        Ok(())
     }
 
     /// Log segment this snapshot uses
