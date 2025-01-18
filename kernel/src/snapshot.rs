@@ -180,12 +180,10 @@ impl Snapshot {
         };
 
         let (metadata, protocol) = log_segment.read_metadata_opt(engine)?;
-
         if let Some(p) = &protocol {
             p.ensure_read_supported()?;
         }
-
-        if let Some(m) = metadata {
+        let (schema, table_properties) = if let Some(m) = &metadata {
             let schema = m.parse_schema()?;
             let table_properties = m.parse_table_properties();
             let column_mapping_mode = column_mapping_mode(
@@ -193,16 +191,22 @@ impl Snapshot {
                 &table_properties,
             );
             validate_schema_column_mapping(&schema, column_mapping_mode)?;
-            self.metadata = m;
-            self.schema = schema;
-            self.table_properties = table_properties;
-        }
+            (Some(schema), Some(table_properties))
+        } else {
+            (None, None)
+        };
 
+        // NOTE: we try to extend the log segment first, so that if it fails, we don't update the
+        // snapshot. Otherwise callers might end up with an inconsistent snapshot.
+        self.log_segment.extend(&log_segment)?;
         if let Some(p) = protocol {
             self.protocol = p;
         }
-
-        self.log_segment.extend(&log_segment)?;
+        if let (Some(m), Some(s), Some(t)) = (metadata, schema, table_properties) {
+            self.metadata = m;
+            self.schema = s;
+            self.table_properties = t;
+        }
 
         Ok(true)
     }
