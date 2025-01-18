@@ -158,19 +158,26 @@ impl Snapshot {
     /// # Parameters
     /// - `target_version`: desired version of the `Snapshot` after update, defaults to latest.
     /// - `engine`: Implementation of [`Engine`] apis.
+    ///
+    /// # Returns
+    /// - boolean flag indicating if the `Snapshot` was updated.
     pub fn update(
         &mut self,
         target_version: impl Into<Option<Version>>,
         engine: &dyn Engine,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<bool> {
         let fs_client = engine.get_file_system_client();
         let log_root = self.table_root.join("_delta_log/")?;
-        let log_segment = LogSegment::for_table_changes(
+        let log_segment = match LogSegment::for_table_changes(
             fs_client.as_ref(),
             log_root,
             self.version() + 1,
             target_version,
-        )?;
+        ) {
+            Ok(segment) => segment,
+            Err(Error::FileNotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
 
         let (metadata, protocol) = log_segment.read_metadata_opt(engine)?;
 
@@ -197,7 +204,7 @@ impl Snapshot {
 
         self.log_segment.extend(&log_segment)?;
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -422,5 +429,8 @@ mod tests {
             snapshot.schema().field("int_decimal").unwrap().data_type(),
             &DataType::Primitive(PrimitiveType::Decimal(11, 1))
         ));
+
+        // update return false if no new version
+        assert!(!snapshot.update(None, &engine).unwrap());
     }
 }

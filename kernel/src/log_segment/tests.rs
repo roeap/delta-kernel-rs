@@ -9,7 +9,7 @@ use crate::engine::default::filesystem::ObjectStoreFileSystemClient;
 use crate::engine::sync::SyncEngine;
 use crate::log_segment::LogSegment;
 use crate::snapshot::CheckpointMetadata;
-use crate::{FileSystemClient, Table};
+use crate::{Error, FileSystemClient, Table};
 use test_utils::delta_path_for_version;
 
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
@@ -500,7 +500,6 @@ fn test_non_contiguous_log() {
 
 #[test]
 fn table_changes_fails_with_larger_start_version_than_end() {
-    // Commit with version 1 is missing
     let (client, log_root) = build_log_with_paths_and_checkpoint(
         &[
             delta_path_for_version(0, "json"),
@@ -510,6 +509,19 @@ fn table_changes_fails_with_larger_start_version_than_end() {
     );
     let log_segment_res = LogSegment::for_table_changes(client.as_ref(), log_root, 1, Some(0));
     assert!(log_segment_res.is_err());
+}
+
+#[test]
+fn empty_log_segment_returns_specific_error() {
+    let (client, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+        ],
+        None,
+    );
+    let log_segment_res = LogSegment::for_table_changes(client.as_ref(), log_root, 2, None);
+    assert!(matches!(log_segment_res, Err(Error::FileNotFound(_))));
 }
 
 #[test]
