@@ -181,6 +181,38 @@ impl LogSegment {
         );
         LogSegment::try_new(ascending_commit_files, vec![], log_root, end_version)
     }
+
+    /// Extends this LogSegment with the contents of another LogSegment.
+    ///
+    /// The other LogSegment must be contiguous with this one, i.e. the end
+    /// version of this LogSegment must be one less than the start version of
+    /// the other LogSegment and contain only commit files.
+    pub(crate) fn extend(&mut self, other: &LogSegment) -> DeltaResult<()> {
+        require!(
+            self.log_root == other.log_root,
+            Error::generic("Cannot merge LogSegments with different log roots")
+        );
+        require!(
+            other.checkpoint_parts.is_empty(),
+            Error::generic("Cannot extend by LogSegments with checkpoint parts")
+        );
+
+        if other.ascending_commit_files.is_empty() {
+            return Ok(());
+        }
+
+        require!(
+            Some(self.end_version + 1) == other.ascending_commit_files.first().map(|f| f.version),
+            Error::generic("Cannot merge non contiguous LogSegments")
+        );
+
+        self.ascending_commit_files
+            .extend(other.ascending_commit_files.iter().cloned());
+        self.end_version = other.end_version;
+
+        Ok(())
+    }
+
     /// Read a stream of log data from this log segment.
     ///
     /// The log files will be read from most recent to oldest.
@@ -226,8 +258,11 @@ impl LogSegment {
         Ok(commit_stream.chain(checkpoint_stream))
     }
 
-    // Get the most up-to-date Protocol and Metadata actions
-    pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
+    // Scan the log segment for metadata and protocol actions
+    pub(crate) fn read_metadata_opt(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<(Option<Metadata>, Option<Protocol>)> {
         let data_batches = self.replay_for_metadata(engine)?;
         let (mut metadata_opt, mut protocol_opt) = (None, None);
         for batch in data_batches {
@@ -243,7 +278,12 @@ impl LogSegment {
                 break;
             }
         }
-        match (metadata_opt, protocol_opt) {
+        Ok((metadata_opt, protocol_opt))
+    }
+
+    // Get the most up-to-date Protocol and Metadata actions
+    pub(crate) fn read_metadata(&self, engine: &dyn Engine) -> DeltaResult<(Metadata, Protocol)> {
+        match self.read_metadata_opt(engine)? {
             (Some(m), Some(p)) => Ok((m, p)),
             (None, Some(_)) => Err(Error::MissingMetadata),
             (Some(_), None) => Err(Error::MissingProtocol),
