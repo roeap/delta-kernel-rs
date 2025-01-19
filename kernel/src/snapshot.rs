@@ -22,6 +22,7 @@ const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
+#[derive(Clone)]
 pub struct Snapshot {
     pub(crate) table_root: Url,
     pub(crate) log_segment: LogSegment,
@@ -101,41 +102,62 @@ impl Snapshot {
         })
     }
 
+    /// Update the `Snapshot` to the target version.
+    ///
+    /// # Parameters
+    /// - `target_version`: desired version of the `Snapshot` after update, defaults to latest.
+    /// - `engine`: Implementation of [`Engine`] apis.
+    ///
+    /// # Returns
+    /// - boolean flag indicating if the `Snapshot` was updated.
     pub fn update(
         &mut self,
         target_version: impl Into<Option<Version>>,
         engine: &dyn Engine,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<bool> {
         let fs_client = engine.get_file_system_client();
         let log_root = self.table_root.join("_delta_log/")?;
-        let log_segment = LogSegment::for_table_changes(
+        let log_segment = match LogSegment::for_table_changes(
             fs_client.as_ref(),
             log_root,
             self.version() + 1,
             target_version,
-        )?;
+        ) {
+            Ok(segment) => segment,
+            Err(Error::FileNotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
 
         let (metadata, protocol) = log_segment.read_metadata_opt(engine)?;
-
-        if let Some(p) = protocol {
-            // important! before a read/write to the table we must check it is supported
+        if let Some(p) = &protocol {
             p.ensure_read_supported()?;
-            self.protocol = p;
         }
-
-        if let Some(m) = metadata {
+        let (schema, table_properties) = if let Some(m) = &metadata {
             let schema = m.parse_schema()?;
             let table_properties = m.parse_table_properties();
-            let column_mapping_mode = column_mapping_mode(&self.protocol, &table_properties);
+            let column_mapping_mode = column_mapping_mode(
+                protocol.as_ref().unwrap_or(&self.protocol),
+                &table_properties,
+            );
             validate_schema_column_mapping(&schema, column_mapping_mode)?;
+            (Some(schema), Some(table_properties))
+        } else {
+            (None, None)
+        };
+
+        // NOTE: we try to extend the log segment first, so that if it fails, we don't update the
+        // snapshot. Otherwise callers might end up with an inconsistent snapshot.
+        self.log_segment.extend(&log_segment)?;
+        if let Some(p) = protocol {
+            self.protocol = p;
+        }
+        if let (Some(m), Some(s), Some(t)) = (metadata, schema, table_properties) {
             self.metadata = m;
-            self.schema = schema;
-            self.table_properties = table_properties;
+            self.schema = s;
+            self.table_properties = t;
         }
 
-        self.log_segment.extend(&log_segment)?;
-
-        Ok(())
+        Ok(true)
     }
 
     /// Log segment this snapshot uses

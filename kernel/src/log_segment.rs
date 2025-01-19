@@ -32,7 +32,7 @@ mod tests;
 /// and in `TableChanges` when built with [`LogSegment::for_table_changes`].
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct LogSegment {
     pub end_version: Version,
@@ -166,14 +166,20 @@ impl LogSegment {
                 .filter_ok(|x| x.is_commit())
                 .try_collect()?;
 
+        // Return a FileNotFound error if there are no new commits.
+        // Callers can then decide how to handle this case.
+        require!(
+            !ascending_commit_files.is_empty(),
+            Error::file_not_found("No new commits.")
+        );
+
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`LogSegment::try_new`] also checks that there are no gaps between commits.
         // If all three are satisfied, this implies that all the desired commits are present.
         require!(
-            ascending_commit_files
-                .first()
-                .is_some_and(|first_commit| first_commit.version == start_version),
+            // safety: we validated the list is not empty above
+            ascending_commit_files[0].version == start_version,
             Error::generic(format!(
                 "Expected the first commit to have version {}",
                 start_version
