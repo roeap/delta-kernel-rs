@@ -534,8 +534,8 @@ impl Scan {
 ///    }
 /// }
 /// ```
-pub fn scan_row_schema() -> Schema {
-    log_replay::SCAN_ROW_SCHEMA.as_ref().clone()
+pub fn scan_row_schema() -> &'static Schema {
+    log_replay::SCAN_ROW_SCHEMA.as_ref()
 }
 
 pub(crate) fn parse_partition_value(

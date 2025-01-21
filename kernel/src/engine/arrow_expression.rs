@@ -437,6 +437,7 @@ fn evaluate_expression(
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch where the
 // names of fields, nullable, and metadata in the struct have been transformed to match those in
 // schema specified by `schema`
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
         return Err(Error::generic(
