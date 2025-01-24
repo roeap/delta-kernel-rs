@@ -289,13 +289,13 @@ fn evaluate_expression(
                     values
                         .as_primitive::<T>()
                         .iter()
-                        .map(move |v| v.map(|vv| from(vv)))
+                        .map(move |v| v.map(from))
                 }
 
                 fn str_op<'a>(
                     column: impl Iterator<Item = Option<&'a str>> + 'a,
                 ) -> impl Iterator<Item = Option<Scalar>> + 'a {
-                    column.map(|v| v.map(|vv| Scalar::from(vv)))
+                    column.map(|v| v.map(Scalar::from))
                 }
 
                 fn op_in(

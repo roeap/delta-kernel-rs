@@ -690,11 +690,11 @@ mod tests {
     fn test_partial_eq() {
         let a = Scalar::Integer(1);
         let b = Scalar::Integer(2);
-        assert_eq!(a.eq(&b), false);
-        assert_eq!(a.eq(&a), true);
+        assert!(!a.eq(&b));
+        assert!(a.eq(&a));
 
         // assert that NULL values are incomparable
         let null = Scalar::Null(DataType::INTEGER);
-        assert_eq!(null.eq(&null), false);
+        assert!(!null.eq(&null));
     }
 }
