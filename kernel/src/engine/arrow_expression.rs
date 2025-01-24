@@ -286,10 +286,7 @@ fn evaluate_expression(
                     values: &dyn Array,
                     from: fn(T::Native) -> Scalar,
                 ) -> impl Iterator<Item = Option<Scalar>> + '_ {
-                    values
-                        .as_primitive::<T>()
-                        .iter()
-                        .map(move |v| v.map(from))
+                    values.as_primitive::<T>().iter().map(move |v| v.map(from))
                 }
 
                 fn str_op<'a>(
