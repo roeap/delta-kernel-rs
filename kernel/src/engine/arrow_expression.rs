@@ -32,6 +32,7 @@ use crate::expressions::{
     BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
     VariadicExpression, VariadicOperator,
 };
+use crate::predicates::PredicateEvaluatorDefaults;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField};
 use crate::{EngineData, ExpressionEvaluator, ExpressionHandler};
 
@@ -281,8 +282,46 @@ fn evaluate_expression(
                 }
             }
             (Column(name), Literal(Scalar::Array(ad))) => {
-                use crate::expressions::ArrayData;
+                fn op<T: ArrowPrimitiveType>(
+                    values: &dyn Array,
+                    from: fn(T::Native) -> Scalar,
+                ) -> impl Iterator<Item = Option<Scalar>> + '_ {
+                    values
+                        .as_primitive::<T>()
+                        .iter()
+                        .map(move |v| v.map(|vv| from(vv)))
+                }
 
+                fn str_op<'a>(
+                    column: impl Iterator<Item = Option<&'a str>> + 'a,
+                ) -> impl Iterator<Item = Option<Scalar>> + 'a {
+                    column.map(|v| v.map(|vv| Scalar::from(vv)))
+                }
+
+                fn op_in(
+                    inlist: &[Scalar],
+                    values: impl Iterator<Item = Option<Scalar>>,
+                ) -> BooleanArray {
+                    // `v IN (k1, ..., kN)` is logically equivalent to `v = k1 OR ... OR v = kN`, so evaluate
+                    // it as such, ensuring correct handling of NULL inputs (including `Scalar::Null`).
+                    values
+                        .map(|v| {
+                            Some(
+                                PredicateEvaluatorDefaults::finish_eval_variadic(
+                                    VariadicOperator::Or,
+                                    inlist.iter().map(|k| v.as_ref().map(|vv| vv == k)),
+                                    false,
+                                )
+                                // None is returned when no dominant value (true) is found and there is at least one NULL
+                                // In th case of IN, this is equivalent to false
+                                .unwrap_or(false),
+                            )
+                        })
+                        .collect()
+                }
+
+                #[allow(deprecated)]
+                let inlist = ad.array_elements();
                 let column = extract_column(batch, name)?;
                 let data_type = ad
                     .array_type()
@@ -295,58 +334,26 @@ fn evaluate_expression(
                         ))
                     })?;
 
-                fn op(
-                    col: impl Iterator<Item = Option<impl Into<Scalar>>>,
-                    ad: &ArrayData,
-                ) -> BooleanArray {
-                    #[allow(deprecated)]
-                    let res = col.map(|val| val.map(|v| ad.array_elements().contains(&v.into())));
-                    BooleanArray::from_iter(res)
-                }
-
                 // safety: as_* methods on arrow arrays can panic, but we checked the data type before applying.
-                let arr: BooleanArray = match (column.data_type(), data_type) {
-                    (ArrowDataType::Utf8, PrimitiveType::String) => op(column.as_string::<i32>().iter(), ad),
-                    (ArrowDataType::LargeUtf8, PrimitiveType::String) => op(column.as_string::<i64>().iter(), ad),
-                    (ArrowDataType::Utf8View, PrimitiveType::String) => op(column.as_string_view().iter(), ad),
-                    (ArrowDataType::Int8, PrimitiveType::Byte) => op(column.as_primitive::<Int8Type>().iter(), ad),
-                    (ArrowDataType::Int16, PrimitiveType::Short) => op(column.as_primitive::<Int16Type>().iter(), ad),
-                    (ArrowDataType::Int32, PrimitiveType::Integer) => op(column.as_primitive::<Int32Type>().iter(), ad),
-                    (ArrowDataType::Int64, PrimitiveType::Long) => op(column.as_primitive::<Int64Type>().iter(), ad),
-                    (ArrowDataType::Float32, PrimitiveType::Float) => op(column.as_primitive::<Float32Type>().iter(), ad),
-                    (ArrowDataType::Float64, PrimitiveType::Double) => op(column.as_primitive::<Float64Type>().iter(), ad),
-                    (ArrowDataType::Date32, PrimitiveType::Date) => {
-                        #[allow(deprecated)]
-                        let res = column
-                            .as_primitive::<Date32Type>()
-                            .iter()
-                            .map(|val| val.map(|v| ad.array_elements().contains(&Scalar::Date(v))));
-                        BooleanArray::from_iter(res)
-                    }
+                let arr = match (column.data_type(), data_type) {
+                    (ArrowDataType::Utf8, PrimitiveType::String) => op_in(inlist, str_op(column.as_string::<i32>().iter())),
+                    (ArrowDataType::LargeUtf8, PrimitiveType::String) => op_in(inlist, str_op(column.as_string::<i64>().iter())),
+                    (ArrowDataType::Utf8View, PrimitiveType::String) => op_in(inlist, str_op(column.as_string_view().iter())),
+                    (ArrowDataType::Int8, PrimitiveType::Byte) => op_in(inlist,op::<Int8Type>( column.as_ref(), Scalar::from)),
+                    (ArrowDataType::Int16, PrimitiveType::Short) => op_in(inlist,op::<Int16Type>(column.as_ref(), Scalar::from)),
+                    (ArrowDataType::Int32, PrimitiveType::Integer) => op_in(inlist,op::<Int32Type>(column.as_ref(), Scalar::from)),
+                    (ArrowDataType::Int64, PrimitiveType::Long) => op_in(inlist,op::<Int64Type>(column.as_ref(), Scalar::from)),
+                    (ArrowDataType::Float32, PrimitiveType::Float) => op_in(inlist,op::<Float32Type>(column.as_ref(), Scalar::from)),
+                    (ArrowDataType::Float64, PrimitiveType::Double) => op_in(inlist,op::<Float64Type>(column.as_ref(), Scalar::from)),
+                    (ArrowDataType::Date32, PrimitiveType::Date) => op_in(inlist,op::<Date32Type>(column.as_ref(), Scalar::Date)),
                     (
-                        ArrowDataType::Timestamp(TimeUnit::Microsecond, unit),
-                        kt @ PrimitiveType::Timestamp | kt @ PrimitiveType::TimestampNtz,
-                    ) => {
-                        let res = column.as_primitive::<TimestampMicrosecondType>().iter();
-                        match (unit, kt) {
-                            // regardless of the time zone stored in the timestamp, the underlying value is always in UTC
-                            (Some(_), PrimitiveType::Timestamp) => {
-                                BooleanArray::from_iter(res.map(|val| {
-                                    #[allow(deprecated)]
-                                    val.map(|v| ad.array_elements().contains(&Scalar::Timestamp(v)))
-                                }))
-                            }
-                            (None, PrimitiveType::TimestampNtz) => {
-                                BooleanArray::from_iter(res.map(|val| {
-                                    val.map(|v| {
-                                        #[allow(deprecated)]
-                                        ad.array_elements().contains(&Scalar::TimestampNtz(v))
-                                    })
-                                }))
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
+                        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)),
+                        PrimitiveType::Timestamp,
+                    ) => op_in(inlist,op::<TimestampMicrosecondType>(column.as_ref(), Scalar::Timestamp)),
+                    (
+                        ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                        PrimitiveType::TimestampNtz,
+                    ) => op_in(inlist,op::<TimestampMicrosecondType>(column.as_ref(), Scalar::TimestampNtz)),
                     (l, r) => {
                         return Err(Error::invalid_expression(format!(
                         "Cannot check if value of type '{l}' is contained in array with values of type '{r}'"

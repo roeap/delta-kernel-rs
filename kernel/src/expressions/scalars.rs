@@ -89,7 +89,7 @@ impl StructData {
 
 /// A single value, which can be null. Used for representing literal values
 /// in [Expressions][crate::expressions::Expression].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Scalar {
     /// 32bit integer
     Integer(i32),
@@ -220,6 +220,48 @@ impl Display for Scalar {
                 }
                 write!(f, ")")
             }
+        }
+    }
+}
+
+impl PartialEq<Scalar> for Scalar {
+    fn eq(&self, other: &Self) -> bool {
+        use Scalar::*;
+        // NOTE: We intentionally do two match arms for each variant to avoid a catch-all, so
+        // that new variants trigger compilation failures instead of being silently ignored.
+        match (self, other) {
+            (Integer(a), Integer(b)) => a == b,
+            (Integer(_), _) => false,
+            (Long(a), Long(b)) => a == b,
+            (Long(_), _) => false,
+            (Short(a), Short(b)) => a == b,
+            (Short(_), _) => false,
+            (Byte(a), Byte(b)) => a == b,
+            (Byte(_), _) => false,
+            (Float(a), Float(b)) => a == b,
+            (Float(_), _) => false,
+            (Double(a), Double(b)) => a == b,
+            (Double(_), _) => false,
+            (String(a), String(b)) => a == b,
+            (String(_), _) => false,
+            (Boolean(a), Boolean(b)) => a == b,
+            (Boolean(_), _) => false,
+            (Timestamp(a), Timestamp(b)) => a == b,
+            (Timestamp(_), _) => false,
+            (TimestampNtz(a), TimestampNtz(b)) => a == b,
+            (TimestampNtz(_), _) => false,
+            (Date(a), Date(b)) => a == b,
+            (Date(_), _) => false,
+            (Binary(a), Binary(b)) => a == b,
+            (Binary(_), _) => false,
+            (Decimal(a, _, _), Decimal(b, _, _)) => a == b,
+            (Decimal(_, _, _), _) => false,
+            (Struct(a), Struct(b)) => a == b,
+            (Struct(_), _) => false,
+            (Array(a), Array(b)) => a == b,
+            (Array(_), _) => false,
+            (Null(_), Null(_)) => false, // NOTE: NULL values are incomparable by definition
+            (Null(_), _) => false,
         }
     }
 }
@@ -585,6 +627,7 @@ mod tests {
         assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
         assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
     }
+
     #[test]
     fn test_timestamp_parse() {
         let assert_timestamp_eq = |scalar_string, micros| {
@@ -599,6 +642,7 @@ mod tests {
         assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
         assert_timestamp_eq("1970-01-01 00:00:00", 0);
     }
+
     #[test]
     fn test_timestamp_ntz_parse() {
         let assert_timestamp_eq = |scalar_string, micros| {
@@ -626,5 +670,31 @@ mod tests {
 
         let p_type = PrimitiveType::Timestamp;
         assert_timestamp_fails(&p_type, "1971-07-22");
+    }
+
+    #[test]
+    fn test_partial_cmp() {
+        let a = Scalar::Integer(1);
+        let b = Scalar::Integer(2);
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(b.partial_cmp(&a), Some(Ordering::Greater));
+        assert_eq!(a.partial_cmp(&a), Some(Ordering::Equal));
+        assert_eq!(b.partial_cmp(&b), Some(Ordering::Equal));
+
+        // assert that NULL values are incomparable
+        let null = Scalar::Null(DataType::INTEGER);
+        assert_eq!(null.partial_cmp(&null), None);
+    }
+
+    #[test]
+    fn test_partial_eq() {
+        let a = Scalar::Integer(1);
+        let b = Scalar::Integer(2);
+        assert_eq!(a.eq(&b), false);
+        assert_eq!(a.eq(&a), true);
+
+        // assert that NULL values are incomparable
+        let null = Scalar::Null(DataType::INTEGER);
+        assert_eq!(null.eq(&null), false);
     }
 }
