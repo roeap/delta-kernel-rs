@@ -1,5 +1,6 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -290,9 +291,9 @@ fn evaluate_expression(
                 }
 
                 fn str_op<'a>(
-                    column: impl Iterator<Item = Option<&'a str>> + 'a,
+                    column: impl IntoIterator<Item = Option<&'a str>> + 'a,
                 ) -> impl Iterator<Item = Option<Scalar>> + 'a {
-                    column.map(|v| v.map(Scalar::from))
+                    column.into_iter().map(|v| v.map(Scalar::from))
                 }
 
                 fn op_in(
@@ -303,15 +304,12 @@ fn evaluate_expression(
                     // it as such, ensuring correct handling of NULL inputs (including `Scalar::Null`).
                     values
                         .map(|v| {
-                            Some(
-                                PredicateEvaluatorDefaults::finish_eval_variadic(
-                                    VariadicOperator::Or,
-                                    inlist.iter().map(|k| v.as_ref().map(|vv| vv == k)),
-                                    false,
-                                )
-                                // None is returned when no dominant value (true) is found and there is at least one NULL
-                                // In th case of IN, this is equivalent to false
-                                .unwrap_or(false),
+                            PredicateEvaluatorDefaults::finish_eval_variadic(
+                                VariadicOperator::Or,
+                                inlist
+                                    .iter()
+                                    .map(|k| Some(v.as_ref()?.partial_cmp(k)? == Ordering::Equal)),
+                                false,
                             )
                         })
                         .collect()
@@ -333,16 +331,18 @@ fn evaluate_expression(
 
                 // safety: as_* methods on arrow arrays can panic, but we checked the data type before applying.
                 let arr = match (column.data_type(), data_type) {
-                    (ArrowDataType::Utf8, PrimitiveType::String) => op_in(inlist, str_op(column.as_string::<i32>().iter())),
-                    (ArrowDataType::LargeUtf8, PrimitiveType::String) => op_in(inlist, str_op(column.as_string::<i64>().iter())),
-                    (ArrowDataType::Utf8View, PrimitiveType::String) => op_in(inlist, str_op(column.as_string_view().iter())),
-                    (ArrowDataType::Int8, PrimitiveType::Byte) => op_in(inlist,op::<Int8Type>( column.as_ref(), Scalar::from)),
-                    (ArrowDataType::Int16, PrimitiveType::Short) => op_in(inlist,op::<Int16Type>(column.as_ref(), Scalar::from)),
-                    (ArrowDataType::Int32, PrimitiveType::Integer) => op_in(inlist,op::<Int32Type>(column.as_ref(), Scalar::from)),
-                    (ArrowDataType::Int64, PrimitiveType::Long) => op_in(inlist,op::<Int64Type>(column.as_ref(), Scalar::from)),
-                    (ArrowDataType::Float32, PrimitiveType::Float) => op_in(inlist,op::<Float32Type>(column.as_ref(), Scalar::from)),
-                    (ArrowDataType::Float64, PrimitiveType::Double) => op_in(inlist,op::<Float64Type>(column.as_ref(), Scalar::from)),
-                    (ArrowDataType::Date32, PrimitiveType::Date) => op_in(inlist,op::<Date32Type>(column.as_ref(), Scalar::Date)),
+                    (ArrowDataType::Utf8, PrimitiveType::String) => op_in(inlist, str_op(column.as_string::<i32>())),
+                    (ArrowDataType::LargeUtf8, PrimitiveType::String) => op_in(inlist, str_op(column.as_string::<i64>())),
+                    (ArrowDataType::Utf8View, PrimitiveType::String) => op_in(inlist, str_op(column.as_string_view())),
+                    (ArrowDataType::Int8, PrimitiveType::Byte) => op_in(inlist,op::<Int8Type>( &column, Scalar::from)),
+                    (ArrowDataType::Int16, PrimitiveType::Short) => op_in(inlist,op::<Int16Type>(&column, Scalar::from)),
+                    (ArrowDataType::Int32, PrimitiveType::Integer) => op_in(inlist,op::<Int32Type>(&column, Scalar::from)),
+                    (ArrowDataType::Int64, PrimitiveType::Long) => op_in(inlist,op::<Int64Type>(&column, Scalar::from)),
+                    (ArrowDataType::Float32, PrimitiveType::Float) => op_in(inlist,op::<Float32Type>(&column, Scalar::from)),
+                    (ArrowDataType::Float64, PrimitiveType::Double) => {op_in(inlist,op::<Float64Type>(&column, Scalar::from))},
+                    (ArrowDataType::Date32, PrimitiveType::Date) => {
+                        op_in(inlist,op::<Date32Type>(&column, Scalar::Date))
+                    },
                     (
                         ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)),
                         PrimitiveType::Timestamp,
