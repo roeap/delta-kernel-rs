@@ -224,45 +224,9 @@ impl Display for Scalar {
     }
 }
 
-impl PartialEq<Scalar> for Scalar {
-    fn eq(&self, other: &Self) -> bool {
-        use Scalar::*;
-        // NOTE: We intentionally do two match arms for each variant to avoid a catch-all, so
-        // that new variants trigger compilation failures instead of being silently ignored.
-        match (self, other) {
-            (Integer(a), Integer(b)) => a == b,
-            (Integer(_), _) => false,
-            (Long(a), Long(b)) => a == b,
-            (Long(_), _) => false,
-            (Short(a), Short(b)) => a == b,
-            (Short(_), _) => false,
-            (Byte(a), Byte(b)) => a == b,
-            (Byte(_), _) => false,
-            (Float(a), Float(b)) => a == b,
-            (Float(_), _) => false,
-            (Double(a), Double(b)) => a == b,
-            (Double(_), _) => false,
-            (String(a), String(b)) => a == b,
-            (String(_), _) => false,
-            (Boolean(a), Boolean(b)) => a == b,
-            (Boolean(_), _) => false,
-            (Timestamp(a), Timestamp(b)) => a == b,
-            (Timestamp(_), _) => false,
-            (TimestampNtz(a), TimestampNtz(b)) => a == b,
-            (TimestampNtz(_), _) => false,
-            (Date(a), Date(b)) => a == b,
-            (Date(_), _) => false,
-            (Binary(a), Binary(b)) => a == b,
-            (Binary(_), _) => false,
-            (Decimal(a, _, _), Decimal(b, _, _)) => a == b,
-            (Decimal(_, _, _), _) => false,
-            (Struct(a), Struct(b)) => a == b,
-            (Struct(_), _) => false,
-            (Array(a), Array(b)) => a == b,
-            (Array(_), _) => false,
-            (Null(_), Null(_)) => false, // NOTE: NULL values are incomparable by definition
-            (Null(_), _) => false,
-        }
+impl PartialEq for Scalar {
+    fn eq(&self, other: &Scalar) -> bool {
+        self.partial_cmp(other) == Some(Ordering::Equal)
     }
 }
 
@@ -676,10 +640,13 @@ mod tests {
     fn test_partial_cmp() {
         let a = Scalar::Integer(1);
         let b = Scalar::Integer(2);
+        let c = Scalar::Null(DataType::INTEGER);
         assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
         assert_eq!(b.partial_cmp(&a), Some(Ordering::Greater));
         assert_eq!(a.partial_cmp(&a), Some(Ordering::Equal));
         assert_eq!(b.partial_cmp(&b), Some(Ordering::Equal));
+        assert_eq!(a.partial_cmp(&c), None);
+        assert_eq!(c.partial_cmp(&a), None);
 
         // assert that NULL values are incomparable
         let null = Scalar::Null(DataType::INTEGER);
@@ -690,8 +657,11 @@ mod tests {
     fn test_partial_eq() {
         let a = Scalar::Integer(1);
         let b = Scalar::Integer(2);
+        let c = Scalar::Null(DataType::INTEGER);
         assert!(!a.eq(&b));
         assert!(a.eq(&a));
+        assert!(!a.eq(&c));
+        assert!(!c.eq(&a));
 
         // assert that NULL values are incomparable
         let null = Scalar::Null(DataType::INTEGER);
