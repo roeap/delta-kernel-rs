@@ -260,10 +260,15 @@ impl PartialOrd for Scalar {
             (Date(_), _) => None,
             (Binary(a), Binary(b)) => a.partial_cmp(b),
             (Binary(_), _) => None,
-            (Decimal(_, _, _), _) => None, // TODO: Support Decimal
-            (Null(_), _) => None,          // NOTE: NULL values are incomparable by definition
-            (Struct(_), _) => None,        // TODO: Support Struct?
-            (Array(_), _) => None,         // TODO: Support Array?
+            (Decimal(v1, _, s1), Decimal(v2, _, s2)) => {
+                let lhs = rust_decimal::Decimal::from_i128_with_scale(*v1, *s1 as u32);
+                let rhs = rust_decimal::Decimal::from_i128_with_scale(*v2, *s2 as u32);
+                lhs.partial_cmp(&rhs)
+            }
+            (Decimal(_, _, _), _) => None,
+            (Null(_), _) => None, // NOTE: NULL values are incomparable by definition
+            (Struct(_), _) => None, // TODO: Support Struct?
+            (Array(_), _) => None, // TODO: Support Array?
         }
     }
 }
