@@ -33,23 +33,33 @@ macro_rules! prim_array_cmp {
         $(
             $data_ty => {
                 let prim_array = $left_arr.as_primitive_opt::<$prim_ty>()
-                        .ok_or(Error::invalid_expression(
-                            format!("Cannot cast to primitive array: {}", $left_arr.data_type()))
-                        )?;
-                    let list_array = $right_arr.as_list_opt::<i32>()
-                        .ok_or(Error::invalid_expression(
-                            format!("Cannot cast to list array: {}", $right_arr.data_type()))
-                        )?;
-                arrow_ord::comparison::in_list(prim_array, list_array).map(wrap_comparison_result)
+                    .ok_or(Error::invalid_expression(
+                        format!("Cannot cast to primitive array: {}", $left_arr.data_type()))
+                    )?;
+                let list_array = $right_arr.as_list_opt::<i32>()
+                    .ok_or(Error::invalid_expression(
+                        format!("Cannot cast to list array: {}", $right_arr.data_type()))
+                    )?;
+                let in_list_result = arrow_ord::comparison::in_list(prim_array, list_array).map_err(Error::generic_err)?;
+                Ok(wrap_comparison_result(
+                    in_list_result
+                        .iter()
+                        .zip(list_array.iter())
+                        .map(|(res, arr)| match (res, arr) {
+                            (Some(false), Some(arr)) if arr.null_count() > 0 => None,
+                            _ => res,
+                        })
+                        .collect(),
+                ))
             }
         )+
-            _ => Err(ArrowError::CastError(
-                        format!("Bad Comparison between: {:?} and {:?}",
-                            $left_arr.data_type(),
-                            $right_arr.data_type())
-                        )
+            _ => Err(Error::invalid_expression(
+                format!("Bad Comparison between: {:?} and {:?}",
+                    $left_arr.data_type(),
+                    $right_arr.data_type())
                 )
-        }.map_err(Error::generic_err);
+            )
+        };
     };
 }
 
