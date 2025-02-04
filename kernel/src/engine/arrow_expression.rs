@@ -307,8 +307,8 @@ fn evaluate_expression(
 
 fn eval_in_list(
     batch: &RecordBatch,
-    left: &Box<Expression>,
-    right: &Box<Expression>,
+    left: &Expression,
+    right: &Expression,
 ) -> Result<Arc<dyn Array>, Error> {
     use Expression::*;
 
@@ -342,13 +342,13 @@ fn eval_in_list(
         };
     }
 
-    match (left.as_ref(), right.as_ref()) {
+    match (left, right) {
         (Literal(lit), Column(_)) => {
             if lit.is_null() {
                 return Ok(Arc::new(BooleanArray::new_null(batch.num_rows())));
             }
-            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+            let left_arr = evaluate_expression(left, batch, None)?;
+            let right_arr = evaluate_expression(right, batch, None)?;
             if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
                 if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
                     return Ok(fix_in_list_result(
