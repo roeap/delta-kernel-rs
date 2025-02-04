@@ -243,7 +243,7 @@ mod tests {
             Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
             Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
         ]
-        .map(|x| Some(x));
+        .map(Some);
 
         let results = BooleanArray::from(vec![Some(false), Some(false)]);
         let expected = Arc::new(BooleanArray::from(vec![None, Some(false)]));
