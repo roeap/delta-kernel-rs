@@ -885,6 +885,12 @@ mod tests {
         let in_expected = BooleanArray::from(vec![None, Some(true), Some(true)]);
         assert_eq!(in_result.as_ref(), &in_expected);
 
+        let in_op = Expression::binary(BinaryOperator::In, "three", column_expr!("item"));
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![None, None, Some(false)]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
         let in_op = Expression::binary(
             BinaryOperator::In,
             Scalar::Null(DeltaDataTypes::STRING),
@@ -916,6 +922,12 @@ mod tests {
         let in_result =
             evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
         let in_expected = BooleanArray::from(vec![None, Some(true), Some(true)]);
+        assert_eq!(in_result.as_ref(), &in_expected);
+
+        let in_op = Expression::binary(BinaryOperator::In, 3, column_expr!("item"));
+        let in_result =
+            evaluate_expression(&in_op, &batch, Some(&DeltaDataTypes::BOOLEAN)).unwrap();
+        let in_expected = BooleanArray::from(vec![None, None, Some(false)]);
         assert_eq!(in_result.as_ref(), &in_expected);
 
         let in_op = Expression::binary(
