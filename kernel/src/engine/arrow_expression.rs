@@ -26,12 +26,11 @@ use itertools::Itertools;
 use super::arrow_conversion::LIST_ARRAY_ROOT;
 use super::arrow_utils::make_arrow_error;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::prim_array_cmp;
 use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
-    BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression, UnaryOperator,
-    VariadicExpression, VariadicOperator,
+    ArrayData, BinaryExpression, BinaryOperator, Expression, Scalar, UnaryExpression,
+    UnaryOperator, VariadicExpression, VariadicOperator,
 };
 use crate::predicates::PredicateEvaluatorDefaults;
 use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField};
@@ -236,169 +235,26 @@ fn evaluate_expression(
                 left,
                 right,
             }),
-            _,
-        ) => match (left.as_ref(), right.as_ref()) {
-            (Literal(lit), Column(_)) => {
-                if lit.is_null() {
-                    return Ok(Arc::new(BooleanArray::from(vec![None; batch.num_rows()])));
-                }
-                let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
-                let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
-                if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
-                    if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
-                        let in_list_result =
-                            in_list_utf8(string_arr, right_arr).map_err(Error::generic_err)?;
-                        return Ok(wrap_comparison_result(
-                            in_list_result
-                                .iter()
-                                .zip(right_arr.iter())
-                                .map(|(res, arr)| match (res, arr) {
-                                    (Some(false), Some(arr)) if arr.null_count() > 0 => None,
-                                    _ => res,
-                                })
-                                .collect(),
-                        ));
-                    }
-                }
-                prim_array_cmp! {
-                    left_arr, right_arr,
-                    (ArrowDataType::Int8, Int8Type),
-                    (ArrowDataType::Int16, Int16Type),
-                    (ArrowDataType::Int32, Int32Type),
-                    (ArrowDataType::Int64, Int64Type),
-                    (ArrowDataType::UInt8, UInt8Type),
-                    (ArrowDataType::UInt16, UInt16Type),
-                    (ArrowDataType::UInt32, UInt32Type),
-                    (ArrowDataType::UInt64, UInt64Type),
-                    (ArrowDataType::Float16, Float16Type),
-                    (ArrowDataType::Float32, Float32Type),
-                    (ArrowDataType::Float64, Float64Type),
-                    (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
-                    (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
-                    (ArrowDataType::Date32, Date32Type),
-                    (ArrowDataType::Date64, Date64Type),
-                    (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
-                    (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
-                    (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
-                    (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
-                    (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
-                    (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
-                    (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
-                    (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
-                    (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
-                    (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
-                    (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
-                    (ArrowDataType::Decimal128(_, _), Decimal128Type),
-                    (ArrowDataType::Decimal256(_, _), Decimal256Type)
-                }
-            }
-            (Column(name), Literal(Scalar::Array(ad))) => {
-                fn op<T: ArrowPrimitiveType>(
-                    values: &dyn Array,
-                    from: fn(T::Native) -> Scalar,
-                ) -> impl Iterator<Item = Option<Scalar>> + '_ {
-                    values.as_primitive::<T>().iter().map(move |v| v.map(from))
-                }
-
-                fn str_op<'a>(
-                    column: impl IntoIterator<Item = Option<&'a str>> + 'a,
-                ) -> impl Iterator<Item = Option<Scalar>> + 'a {
-                    column.into_iter().map(|v| v.map(Scalar::from))
-                }
-
-                fn op_in(
-                    inlist: &[Scalar],
-                    values: impl Iterator<Item = Option<Scalar>>,
-                ) -> BooleanArray {
-                    // `v IN (k1, ..., kN)` is logically equivalent to `v = k1 OR ... OR v = kN`, so evaluate
-                    // it as such, ensuring correct handling of NULL inputs (including `Scalar::Null`).
-                    values
-                        .map(|v| {
-                            PredicateEvaluatorDefaults::finish_eval_variadic(
-                                VariadicOperator::Or,
-                                inlist
-                                    .iter()
-                                    .map(|k| Some(v.as_ref()?.partial_cmp(k)? == Ordering::Equal)),
-                                false,
-                            )
-                        })
-                        .collect()
-                }
-
-                #[allow(deprecated)]
-                let inlist = ad.array_elements();
-                let column = extract_column(batch, name)?;
-                let data_type = ad
-                    .array_type()
-                    .element_type()
-                    .as_primitive_opt()
-                    .ok_or_else(|| {
-                        Error::invalid_expression(format!(
-                            "IN only supports array literals with primitive elements, got: '{:?}'",
-                            ad.array_type().element_type()
-                        ))
-                    })?;
-
-                // safety: as_* methods on arrow arrays can panic, but we checked the data type before applying.
-                let arr = match (column.data_type(), data_type) {
-                    (ArrowDataType::Utf8, PrimitiveType::String) => op_in(inlist, str_op(column.as_string::<i32>())),
-                    (ArrowDataType::LargeUtf8, PrimitiveType::String) => op_in(inlist, str_op(column.as_string::<i64>())),
-                    (ArrowDataType::Utf8View, PrimitiveType::String) => op_in(inlist, str_op(column.as_string_view())),
-                    (ArrowDataType::Int8, PrimitiveType::Byte) => op_in(inlist,op::<Int8Type>( &column, Scalar::from)),
-                    (ArrowDataType::Int16, PrimitiveType::Short) => op_in(inlist,op::<Int16Type>(&column, Scalar::from)),
-                    (ArrowDataType::Int32, PrimitiveType::Integer) => op_in(inlist,op::<Int32Type>(&column, Scalar::from)),
-                    (ArrowDataType::Int64, PrimitiveType::Long) => op_in(inlist,op::<Int64Type>(&column, Scalar::from)),
-                    (ArrowDataType::Float32, PrimitiveType::Float) => op_in(inlist,op::<Float32Type>(&column, Scalar::from)),
-                    (ArrowDataType::Float64, PrimitiveType::Double) => op_in(inlist,op::<Float64Type>(&column, Scalar::from)),
-                    (ArrowDataType::Date32, PrimitiveType::Date) => {
-                        op_in(inlist,op::<Date32Type>(&column, Scalar::Date))
-                    },
-                    (
-                        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)),
-                        PrimitiveType::Timestamp,
-                    ) => op_in(inlist,op::<TimestampMicrosecondType>(column.as_ref(), Scalar::Timestamp)),
-                    (
-                        ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
-                        PrimitiveType::TimestampNtz,
-                    ) => op_in(inlist,op::<TimestampMicrosecondType>(column.as_ref(), Scalar::TimestampNtz)),
-                    (l, r) => {
-                        return Err(Error::invalid_expression(format!(
-                        "Cannot check if value of type '{l}' is contained in array with values of type '{r}'"
-                    )))
-                    }
-                };
-                Ok(Arc::new(arr))
-            }
-            (Literal(lit), Literal(Scalar::Array(ad))) => {
-                #[allow(deprecated)]
-                let exists = PredicateEvaluatorDefaults::finish_eval_variadic(
-                    VariadicOperator::Or,
-                    ad.array_elements()
-                        .iter()
-                        .map(|k| Some(lit.partial_cmp(k)? == Ordering::Equal)),
-                    false,
-                );
-                Ok(Arc::new(BooleanArray::from(vec![exists; batch.num_rows()])))
-            }
-            (l, r) => Err(Error::invalid_expression(format!(
-                "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
-            ))),
-        },
+            None | Some(&DataType::BOOLEAN),
+        ) => eval_in_list(batch, left, right),
         (
             Binary(BinaryExpression {
                 op: NotIn,
                 left,
                 right,
             }),
-            _,
+            None | Some(&DataType::BOOLEAN),
         ) => {
             let reverse_op = Expression::binary(In, *left.clone(), *right.clone());
             let reverse_expr = evaluate_expression(&reverse_op, batch, None)?;
             not(reverse_expr.as_boolean())
                 .map(wrap_comparison_result)
                 .map_err(Error::generic_err)
+        }
+        (Binary(BinaryExpression { op: In | NotIn, .. }), Some(_)) => {
+            Err(Error::invalid_expression(format!(
+                "(NOT) IN expression is expected to return boolean results, got: {result_type:?}"
+            )))
         }
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
@@ -447,6 +303,219 @@ fn evaluate_expression(
             )))
         }
     }
+}
+
+fn eval_in_list(
+    batch: &RecordBatch,
+    left: &Box<Expression>,
+    right: &Box<Expression>,
+) -> Result<Arc<dyn Array>, Error> {
+    use Expression::*;
+
+    macro_rules! prim_array_cmp {
+        ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
+
+            return match $left_arr.data_type() {
+            $(
+                $data_ty => {
+                    let prim_array = $left_arr.as_primitive_opt::<$prim_ty>()
+                        .ok_or(Error::invalid_expression(
+                            format!("Cannot cast to primitive array: {}", $left_arr.data_type()))
+                        )?;
+                    let list_array = $right_arr.as_list_opt::<i32>()
+                        .ok_or(Error::invalid_expression(
+                            format!("Cannot cast to list array: {}", $right_arr.data_type()))
+                        )?;
+                    Ok(fix_in_list_result(
+                        arrow_ord::comparison::in_list(prim_array, list_array).map_err(Error::generic_err)?,
+                        list_array.iter(),
+                    ))
+                }
+            )+
+                _ => Err(Error::invalid_expression(
+                    format!("Bad Comparison between: {:?} and {:?}",
+                        $left_arr.data_type(),
+                        $right_arr.data_type())
+                    )
+                )
+            };
+        };
+    }
+
+    match (left.as_ref(), right.as_ref()) {
+        (Literal(lit), Column(_)) => {
+            if lit.is_null() {
+                return Ok(Arc::new(BooleanArray::new_null(batch.num_rows())));
+            }
+            let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
+            let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
+            if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
+                if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
+                    return Ok(fix_in_list_result(
+                        in_list_utf8(string_arr, right_arr).map_err(Error::generic_err)?,
+                        right_arr.iter(),
+                    ));
+                }
+            }
+            prim_array_cmp! {
+                left_arr, right_arr,
+                (ArrowDataType::Int8, Int8Type),
+                (ArrowDataType::Int16, Int16Type),
+                (ArrowDataType::Int32, Int32Type),
+                (ArrowDataType::Int64, Int64Type),
+                (ArrowDataType::UInt8, UInt8Type),
+                (ArrowDataType::UInt16, UInt16Type),
+                (ArrowDataType::UInt32, UInt32Type),
+                (ArrowDataType::UInt64, UInt64Type),
+                (ArrowDataType::Float16, Float16Type),
+                (ArrowDataType::Float32, Float32Type),
+                (ArrowDataType::Float64, Float64Type),
+                (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
+                (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
+                (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
+                (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
+                (ArrowDataType::Date32, Date32Type),
+                (ArrowDataType::Date64, Date64Type),
+                (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
+                (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
+                (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
+                (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
+                (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
+                (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
+                (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
+                (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
+                (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
+                (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
+                (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
+                (ArrowDataType::Decimal128(_, _), Decimal128Type),
+                (ArrowDataType::Decimal256(_, _), Decimal256Type)
+            }
+        }
+        (Column(name), Literal(Scalar::Array(ad))) => {
+            fn op<T: ArrowPrimitiveType>(
+                values: &dyn Array,
+                from: fn(T::Native) -> Scalar,
+            ) -> impl IntoIterator<Item = Option<Scalar>> + '_ {
+                values.as_primitive::<T>().iter().map(move |v| v.map(from))
+            }
+
+            fn str_op<'a>(
+                column: impl IntoIterator<Item = Option<&'a str>> + 'a,
+            ) -> impl IntoIterator<Item = Option<Scalar>> + 'a {
+                column.into_iter().map(|v| v.map(Scalar::from))
+            }
+
+            let column = extract_column(batch, name)?;
+            let data_type = ad
+                .array_type()
+                .element_type()
+                .as_primitive_opt()
+                .ok_or_else(|| {
+                    Error::invalid_expression(format!(
+                        "IN only supports array literals with primitive elements, got: '{:?}'",
+                        ad.array_type().element_type()
+                    ))
+                })?;
+
+            // safety: as_* methods on arrow arrays can panic, but we checked the data type before applying.
+            let arr = match (column.data_type(), data_type) {
+                    (ArrowDataType::Utf8, PrimitiveType::String) => is_in_list(
+                        ad, str_op(column.as_string::<i32>())
+                    ),
+                    (ArrowDataType::LargeUtf8, PrimitiveType::String) => is_in_list(
+                        ad, str_op(column.as_string::<i64>())
+                    ),
+                    (ArrowDataType::Utf8View, PrimitiveType::String) => is_in_list(
+                        ad, str_op(column.as_string_view())
+                    ),
+                    (ArrowDataType::Int8, PrimitiveType::Byte) =>  is_in_list(
+                        ad,op::<Int8Type>( &column, Scalar::from)
+                    ),
+                    (ArrowDataType::Int16, PrimitiveType::Short) => is_in_list(
+                        ad,op::<Int16Type>(&column, Scalar::from)
+                    ),
+                    (ArrowDataType::Int32, PrimitiveType::Integer) => is_in_list(
+                        ad,op::<Int32Type>(&column, Scalar::from)
+                    ),
+                    (ArrowDataType::Int64, PrimitiveType::Long) => is_in_list(
+                        ad,op::<Int64Type>(&column, Scalar::from)
+                    ),
+                    (ArrowDataType::Float32, PrimitiveType::Float) => is_in_list(
+                        ad,op::<Float32Type>(&column, Scalar::from)
+                    ),
+                    (ArrowDataType::Float64, PrimitiveType::Double) => is_in_list(
+                        ad,op::<Float64Type>(&column, Scalar::from)
+                    ),
+                    (ArrowDataType::Date32, PrimitiveType::Date) =>  is_in_list(
+                        ad,op::<Date32Type>(&column, Scalar::Date)
+                    ),
+                    (
+                        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)),
+                        PrimitiveType::Timestamp,
+                    ) => is_in_list(
+                        ad,op::<TimestampMicrosecondType>(column.as_ref(), Scalar::Timestamp)
+                    ),
+                    (
+                        ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                        PrimitiveType::TimestampNtz,
+                    ) => is_in_list(
+                        ad,op::<TimestampMicrosecondType>(column.as_ref(), Scalar::TimestampNtz)
+                    ),
+                    (l, r) => {
+                        return Err(Error::invalid_expression(format!(
+                        "Cannot check if value of type '{l}' is contained in array with values of type '{r}'"
+                    )))
+                    }
+                };
+            Ok(wrap_comparison_result(arr))
+        }
+        (Literal(lit), Literal(Scalar::Array(ad))) => {
+            let res = is_in_list(ad, Some(Some(lit.clone())));
+            let exists = res.is_valid(0).then(|| res.value(0));
+            Ok(Arc::new(BooleanArray::from(vec![exists; batch.num_rows()])))
+        }
+        (l, r) => Err(Error::invalid_expression(format!(
+            "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
+        ))),
+    }
+}
+
+fn is_in_list(ad: &ArrayData, values: impl IntoIterator<Item = Option<Scalar>>) -> BooleanArray {
+    #[allow(deprecated)]
+    let inlist = ad.array_elements();
+    // `v IN (k1, ..., kN)` is logically equivalent to `v = k1 OR ... OR v = kN`, so evaluate
+    // it as such, ensuring correct handling of NULL inputs (including `Scalar::Null`).
+    values
+        .into_iter()
+        .map(|v| {
+            PredicateEvaluatorDefaults::finish_eval_variadic(
+                VariadicOperator::Or,
+                inlist
+                    .iter()
+                    .map(|k| Some(v.as_ref()?.partial_cmp(k)? == Ordering::Equal)),
+                false,
+            )
+        })
+        .collect()
+}
+
+// helper function to make arrow in_list* kernel results comliant with SQL NULL semantics.
+// Specifically, if an item is not found in the in-list, but the in-list contains NULLs, the
+// result should be NULL (UNKNOWN) as well.
+fn fix_in_list_result(
+    results: BooleanArray,
+    in_lists: impl IntoIterator<Item = Option<ArrayRef>>,
+) -> ArrayRef {
+    wrap_comparison_result(
+        results
+            .iter()
+            .zip(in_lists)
+            .map(|(res, arr)| match (res, arr) {
+                (Some(false), Some(arr)) if arr.null_count() > 0 => None,
+                _ => res,
+            })
+            .collect(),
+    )
 }
 
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch where the
