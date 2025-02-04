@@ -20,7 +20,6 @@ use arrow_schema::{
 use arrow_select::concat::concat;
 use itertools::Itertools;
 
-use self::in_list::eval_in_list;
 use super::arrow_conversion::LIST_ARRAY_ROOT;
 use super::arrow_utils::make_arrow_error;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -237,7 +236,7 @@ fn evaluate_expression(
                 right,
             }),
             None | Some(&DataType::BOOLEAN),
-        ) => eval_in_list(batch, left, right),
+        ) => in_list::eval_in_list(batch, left, right),
         (
             Binary(BinaryExpression {
                 op: NotIn,
