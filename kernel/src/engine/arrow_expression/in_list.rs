@@ -126,54 +126,56 @@ pub(super) fn eval_in_list(
 
             // safety: as_* methods on arrow arrays can panic, but we checked the data type before applying.
             let arr = match (column.data_type(), data_type) {
-                    (ArrowDataType::Utf8, PrimitiveType::String) => is_in_list(
-                        ad, str_op(column.as_string::<i32>())
-                    ),
-                    (ArrowDataType::LargeUtf8, PrimitiveType::String) => is_in_list(
-                        ad, str_op(column.as_string::<i64>())
-                    ),
-                    (ArrowDataType::Utf8View, PrimitiveType::String) => is_in_list(
-                        ad, str_op(column.as_string_view())
-                    ),
-                    (ArrowDataType::Int8, PrimitiveType::Byte) =>  is_in_list(
-                        ad,op::<Int8Type>(&column, Scalar::from)
-                    ),
-                    (ArrowDataType::Int16, PrimitiveType::Short) => is_in_list(
-                        ad,op::<Int16Type>(&column, Scalar::from)
-                    ),
-                    (ArrowDataType::Int32, PrimitiveType::Integer) => is_in_list(
-                        ad,op::<Int32Type>(&column, Scalar::from)
-                    ),
-                    (ArrowDataType::Int64, PrimitiveType::Long) => is_in_list(
-                        ad,op::<Int64Type>(&column, Scalar::from)
-                    ),
-                    (ArrowDataType::Float32, PrimitiveType::Float) => is_in_list(
-                        ad,op::<Float32Type>(&column, Scalar::from)
-                    ),
-                    (ArrowDataType::Float64, PrimitiveType::Double) => is_in_list(
-                        ad,op::<Float64Type>(&column, Scalar::from)
-                    ),
-                    (ArrowDataType::Date32, PrimitiveType::Date) =>  is_in_list(
-                        ad,op::<Date32Type>(&column, Scalar::Date)
-                    ),
-                    (
-                        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)),
-                        PrimitiveType::Timestamp,
-                    ) => is_in_list(
-                        ad, op::<TimestampMicrosecondType>(column.as_ref(), Scalar::Timestamp)
-                    ),
-                    (
-                        ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
-                        PrimitiveType::TimestampNtz,
-                    ) => is_in_list(
-                        ad, op::<TimestampMicrosecondType>(column.as_ref(), Scalar::TimestampNtz)
-                    ),
-                    (l, r) => {
-                        return Err(Error::invalid_expression(format!(
-                        "Cannot check if value of type '{l}' is contained in array with values of type '{r}'"
+                (ArrowDataType::Utf8, PrimitiveType::String) => {
+                    is_in_list(ad, str_op(column.as_string::<i32>()))
+                }
+                (ArrowDataType::LargeUtf8, PrimitiveType::String) => {
+                    is_in_list(ad, str_op(column.as_string::<i64>()))
+                }
+                (ArrowDataType::Utf8View, PrimitiveType::String) => {
+                    is_in_list(ad, str_op(column.as_string_view()))
+                }
+                (ArrowDataType::Int8, PrimitiveType::Byte) => {
+                    is_in_list(ad, op::<Int8Type>(&column, Scalar::from))
+                }
+                (ArrowDataType::Int16, PrimitiveType::Short) => {
+                    is_in_list(ad, op::<Int16Type>(&column, Scalar::from))
+                }
+                (ArrowDataType::Int32, PrimitiveType::Integer) => {
+                    is_in_list(ad, op::<Int32Type>(&column, Scalar::from))
+                }
+                (ArrowDataType::Int64, PrimitiveType::Long) => {
+                    is_in_list(ad, op::<Int64Type>(&column, Scalar::from))
+                }
+                (ArrowDataType::Float32, PrimitiveType::Float) => {
+                    is_in_list(ad, op::<Float32Type>(&column, Scalar::from))
+                }
+                (ArrowDataType::Float64, PrimitiveType::Double) => {
+                    is_in_list(ad, op::<Float64Type>(&column, Scalar::from))
+                }
+                (ArrowDataType::Date32, PrimitiveType::Date) => {
+                    is_in_list(ad, op::<Date32Type>(&column, Scalar::Date))
+                }
+                (
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)),
+                    PrimitiveType::Timestamp,
+                ) => is_in_list(
+                    ad,
+                    op::<TimestampMicrosecondType>(column.as_ref(), Scalar::Timestamp),
+                ),
+                (
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                    PrimitiveType::TimestampNtz,
+                ) => is_in_list(
+                    ad,
+                    op::<TimestampMicrosecondType>(column.as_ref(), Scalar::TimestampNtz),
+                ),
+                (l, r) => {
+                    return Err(Error::invalid_expression(format!(
+                        "Cannot check if value of type '{l}' is in array with value type '{r}'"
                     )))
-                    }
-                };
+                }
+            };
             Ok(wrap_comparison_result(arr))
         }
         (Literal(lit), Literal(Scalar::Array(ad))) => {
