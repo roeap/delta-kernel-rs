@@ -6,10 +6,9 @@ use std::sync::Arc;
 use arrow_arith::boolean::{and_kleene, is_null, not, or_kleene};
 use arrow_arith::numeric::{add, div, mul, sub};
 use arrow_array::cast::AsArray;
-use arrow_array::MapArray;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, RecordBatch,
     StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow_buffer::OffsetBuffer;
@@ -565,7 +564,7 @@ mod tests {
         assert!(in_result.is_err());
         assert_eq!(
             in_result.unwrap_err().to_string(),
-            "Invalid expression evaluation: Cannot cast to list array: Int32"
+            "Invalid expression evaluation: Expected right hand side to be list column, got: Int32"
         );
     }
 

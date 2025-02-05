@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use arrow_cast::cast;
 use arrow_ord::comparison::{in_list, in_list_utf8};
 use arrow_schema::{DataType as ArrowDataType, IntervalUnit, TimeUnit};
 
@@ -22,14 +23,29 @@ macro_rules! prim_array_cmp {
                     .ok_or(Error::invalid_expression(
                         format!("Cannot cast to primitive array: {}", $left_arr.data_type()))
                     )?;
-                let list_array = $right_arr.as_list_opt::<i32>()
-                    .ok_or(Error::invalid_expression(
-                        format!("Cannot cast to list array: {}", $right_arr.data_type()))
-                    )?;
-                Ok(fix_arrow_in_list_result(
-                    in_list(prim_array, list_array).map_err(Error::generic_err)?,
-                    list_array.iter(),
-                ))
+                match $right_arr.data_type() {
+                    ArrowDataType::List(_) => {
+                        let list_array = $right_arr.as_list::<i32>();
+                        Ok(fix_arrow_in_list_result(
+                            in_list(prim_array, &list_array).map_err(Error::generic_err)?,
+                            list_array.iter(),
+                        ))
+                    },
+                    ArrowDataType::LargeList(_) => {
+                        let list_array = $right_arr.as_list::<i64>();
+                        Ok(fix_arrow_in_list_result(
+                            in_list(prim_array, &list_array).map_err(Error::generic_err)?,
+                            list_array.iter(),
+                        ))
+                    },
+                    // TODO: LargeListView - not fully supported by arrow yet
+                    _ => {
+                        Err(Error::invalid_expression(format!(
+                            "Expected right hand side to be list column, got: {:?}",
+                            $right_arr.data_type()
+                        )))
+                    }
+                }
             }
         )+
             _ => Err(Error::invalid_expression(
@@ -54,16 +70,49 @@ pub(super) fn eval_in_list(
             if lit.is_null() {
                 return Ok(Arc::new(BooleanArray::new_null(batch.num_rows())));
             }
-            let left_arr = evaluate_expression(left, batch, None)?;
+
             let right_arr = evaluate_expression(right, batch, None)?;
-            if let Some(string_arr) = left_arr.as_string_opt::<i32>() {
+            let list_field = match right_arr.data_type() {
+                ArrowDataType::List(list_field) => list_field,
+                ArrowDataType::LargeList(list_field) => list_field,
+                // TODO: LargeListView - not fully supported by arrow yet
+                _ => {
+                    return Err(Error::invalid_expression(format!(
+                        "Expected right hand side to be list column, got: {:?}",
+                        right_arr.data_type()
+                    )));
+                }
+            };
+
+            let left_arr =
+                evaluate_expression(left, batch, Some(&list_field.data_type().try_into()?))?;
+
+            if matches!(
+                list_field.data_type(),
+                ArrowDataType::Utf8 | ArrowDataType::LargeUtf8
+            ) {
                 if let Some(right_arr) = right_arr.as_list_opt::<i32>() {
-                    return Ok(fix_arrow_in_list_result(
-                        in_list_utf8(string_arr, right_arr).map_err(Error::generic_err)?,
-                        right_arr.iter(),
-                    ));
+                    // Note: since delta types are purely logical and arrow types also consider the
+                    // the physical layout, we may need to cast between different offsets.
+                    let left_arr = if left_arr.data_type() == list_field.data_type() {
+                        left_arr
+                    } else {
+                        cast(left_arr.as_ref(), list_field.data_type())
+                            .map_err(Error::generic_err)?
+                    };
+
+                    let result = match left_arr.data_type() {
+                        ArrowDataType::Utf8 => in_list_utf8(left_arr.as_string::<i32>(), right_arr),
+                        ArrowDataType::LargeUtf8 => {
+                            in_list_utf8(left_arr.as_string::<i64>(), right_arr)
+                        }
+                        _ => unreachable!(),
+                    }
+                    .map_err(Error::generic_err)?;
+                    return Ok(fix_arrow_in_list_result(result, right_arr.iter()));
                 }
             }
+
             prim_array_cmp! {
                 left_arr, right_arr,
                 (ArrowDataType::Int8, Int8Type),
@@ -112,6 +161,12 @@ pub(super) fn eval_in_list(
                 column.into_iter().map(|v| v.map(Scalar::from))
             }
 
+            fn binary_op<'a>(
+                column: impl IntoIterator<Item = Option<&'a [u8]>> + 'a,
+            ) -> impl IntoIterator<Item = Option<Scalar>> + 'a {
+                column.into_iter().map(|v| v.map(Scalar::from))
+            }
+
             let column = extract_column(batch, name)?;
             let data_type = ad
                 .array_type()
@@ -152,6 +207,19 @@ pub(super) fn eval_in_list(
                 }
                 (ArrowDataType::Float64, PrimitiveType::Double) => {
                     is_in_list(ad, op::<Float64Type>(&column, Scalar::from))
+                }
+                (ArrowDataType::Boolean, PrimitiveType::Boolean) => {
+                    let iter = column.as_boolean().into_iter().map(|v| v.map(Scalar::from));
+                    is_in_list(ad, iter)
+                }
+                (ArrowDataType::Binary, PrimitiveType::Binary) => {
+                    is_in_list(ad, binary_op(column.as_binary::<i32>()))
+                }
+                (ArrowDataType::LargeBinary, PrimitiveType::Binary) => {
+                    is_in_list(ad, binary_op(column.as_binary::<i64>()))
+                }
+                (ArrowDataType::BinaryView, PrimitiveType::Binary) => {
+                    is_in_list(ad, binary_op(column.as_binary_view()))
                 }
                 (ArrowDataType::Date32, PrimitiveType::Date) => {
                     is_in_list(ad, op::<Date32Type>(&column, Scalar::Date))
@@ -229,7 +297,11 @@ fn fix_arrow_in_list_result(
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{GenericStringArray, Int32Array, ListArray};
+    use arrow_array::{
+        BinaryArray, BinaryViewArray, Date32Array, Float32Array, Float64Array, Int16Array,
+        Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeListArray, LargeStringArray,
+        ListArray, StringArray, StringViewArray, TimestampMicrosecondArray,
+    };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
 
@@ -241,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_fix_arrow_in_list_result() {
-        let in_lists: [Option<ArrayRef>; 2] = [
+        let in_lists = [
             Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
             Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
         ]
@@ -286,25 +358,22 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_in_list_lit_in_col() {
-        let values = GenericStringArray::<i32>::from(vec![
-            Some("one"),
-            None,
-            Some("two"),
-            None,
-            Some("one"),
-            Some("two"),
-        ]);
+    fn test_eval_in_list_lit_in_col_large() {
+        let values = Int32Array::from(vec![Some(1), None, Some(2), None, Some(1), Some(2)]);
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 4, 6]));
-        let field = Arc::new(Field::new("item", ArrowDataType::Utf8, true));
-        let arr_field = Arc::new(Field::new("item", ArrowDataType::List(field.clone()), true));
+        let field = Arc::new(Field::new("item", ArrowDataType::Int32, true));
+        let arr_field = Arc::new(Field::new(
+            "item",
+            ArrowDataType::LargeList(field.clone()),
+            true,
+        ));
         let schema = arrow_schema::Schema::new([arr_field.clone()]);
-        let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
+        let array = LargeListArray::new(field.clone(), offsets, Arc::new(values), None);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
         let result = eval_in_list(
             &batch,
-            &Expression::literal(Scalar::from("one")),
+            &Expression::literal(Scalar::Integer(1)),
             &column_expr!("item"),
         )
         .unwrap();
@@ -313,7 +382,7 @@ mod tests {
 
         let result = eval_in_list(
             &batch,
-            &Expression::literal(Scalar::from("three")),
+            &Expression::literal(Scalar::Integer(3)),
             &column_expr!("item"),
         )
         .unwrap();
@@ -322,19 +391,161 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_in_list_col_in_lit() {
-        let values = GenericStringArray::<i32>::from(vec![Some("one"), None, Some("three")]);
-        let field = Arc::new(Field::new("item", ArrowDataType::Utf8, true));
-        let schema = arrow_schema::Schema::new([field.clone()]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values.clone())]).unwrap();
+    fn test_eval_in_list() {
+        let cases = [
+            (
+                DataType::STRING,
+                Arc::new(StringArray::from(vec![Some("one"), None, Some("three")])) as ArrayRef,
+                Scalar::from("one"),
+            ),
+            (
+                DataType::STRING,
+                Arc::new(LargeStringArray::from(vec![
+                    Some("one"),
+                    None,
+                    Some("three"),
+                ])),
+                Scalar::from("one"),
+            ),
+            (
+                DataType::STRING,
+                Arc::new(StringViewArray::from(vec![
+                    Some("one"),
+                    None,
+                    Some("three"),
+                ])),
+                Scalar::from("one"),
+            ),
+            (
+                DataType::INTEGER,
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+                Scalar::Integer(1),
+            ),
+            (
+                DataType::SHORT,
+                Arc::new(Int16Array::from(vec![Some(1), None, Some(3)])),
+                Scalar::Short(1),
+            ),
+            (
+                DataType::LONG,
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+                Scalar::Long(1),
+            ),
+            (
+                DataType::BYTE,
+                Arc::new(Int8Array::from(vec![Some(1), None, Some(3)])),
+                Scalar::Byte(1),
+            ),
+            (
+                DataType::FLOAT,
+                Arc::new(Float32Array::from(vec![Some(1.0), None, Some(3.0)])),
+                Scalar::Float(1.0),
+            ),
+            (
+                DataType::DOUBLE,
+                Arc::new(Float64Array::from(vec![Some(1.0), None, Some(3.0)])),
+                Scalar::Double(1.0),
+            ),
+            (
+                DataType::BOOLEAN,
+                Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+                Scalar::Boolean(true),
+            ),
+            (
+                DataType::BINARY,
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"one"),
+                    None,
+                    Some(b"three"),
+                ])),
+                Scalar::Binary(b"one".to_vec()),
+            ),
+            (
+                DataType::BINARY,
+                Arc::new(LargeBinaryArray::from_opt_vec(vec![
+                    Some(b"one"),
+                    None,
+                    Some(b"three"),
+                ])),
+                Scalar::Binary(b"one".to_vec()),
+            ),
+            (
+                DataType::BINARY,
+                Arc::new(BinaryViewArray::from_iter(vec![
+                    Some(b"one".to_vec()),
+                    None,
+                    Some(b"three".to_vec()),
+                ])),
+                Scalar::Binary(b"one".to_vec()),
+            ),
+            // TODO: decimal
+            (
+                DataType::DATE,
+                Arc::new(Date32Array::from(vec![Some(1), None, Some(3)])),
+                Scalar::Date(1),
+            ),
+            (
+                DataType::TIMESTAMP,
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(1), None, Some(3)])
+                        .with_timezone_utc(),
+                ),
+                Scalar::Timestamp(1),
+            ),
+            (
+                DataType::TIMESTAMP_NTZ,
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(1),
+                    None,
+                    Some(3),
+                ])),
+                Scalar::TimestampNtz(1),
+            ),
+        ];
 
-        let rhs = Expression::literal(Scalar::Array(ArrayData::new(
-            ArrayType::new(PrimitiveType::String.into(), true),
-            ["one".into(), Scalar::Null(DataType::STRING)],
-        )));
-        let result = eval_in_list(&batch, &column_expr!("item"), &rhs).unwrap();
-        let expected = Arc::new(BooleanArray::from(vec![Some(true), None, None]));
-        assert_eq!(result.as_ref(), expected.as_ref());
+        // unsupported types due to lack of arrow kernel support
+        let unsupported = &[
+            ArrowDataType::Utf8View,
+            ArrowDataType::Binary,
+            ArrowDataType::LargeBinary,
+            ArrowDataType::BinaryView,
+            ArrowDataType::Boolean,
+        ];
+
+        for (data_type, values, list_value) in cases {
+            let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+            let schema = arrow_schema::Schema::new([field.clone()]);
+            let batch = RecordBatch::try_new(Arc::new(schema), vec![values.clone()]).unwrap();
+
+            // test "col IN (lit1, lit2, ...)"
+            let rhs = Expression::literal(Scalar::Array(ArrayData::new(
+                ArrayType::new(data_type.clone(), true),
+                [list_value.clone(), Scalar::Null(data_type)],
+            )));
+            let result = eval_in_list(&batch, &column_expr!("item"), &rhs).unwrap();
+            let expected = Arc::new(BooleanArray::from(vec![Some(true), None, None]));
+            assert_eq!(result.as_ref(), expected.as_ref());
+
+            // test "lit IN (col)"
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2, 3]));
+            let list_field = Arc::new(Field::new("item", ArrowDataType::List(field.clone()), true));
+            let schema = arrow_schema::Schema::new([list_field.clone()]);
+            let array = ListArray::new(field.clone(), offsets, values.clone(), None);
+            let batch =
+                RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
+            let result = eval_in_list(
+                &batch,
+                &Expression::literal(list_value),
+                &column_expr!("item"),
+            );
+            if unsupported.contains(values.data_type()) {
+                assert!(result.is_err());
+            } else {
+                let result = result.unwrap();
+                let expected = Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)]));
+                assert_eq!(result.as_ref(), expected.as_ref());
+            }
+        }
     }
 
     #[test]
