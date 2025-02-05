@@ -6,9 +6,9 @@ use arrow_array::{types::*, ArrowNumericType, GenericListArray, OffsetSizeTrait,
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow_cast::cast;
 use arrow_ord::comparison::{in_list, in_list_utf8};
-use arrow_schema::{DataType as ArrowDataType, IntervalUnit, TimeUnit};
+use arrow_schema::{DataType as ArrowDataType, TimeUnit};
 
-use super::{evaluate_expression, extract_column, wrap_comparison_result};
+use super::{evaluate_expression, extract_column};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{ArrayData, Expression, Scalar, VariadicOperator};
 use crate::predicates::PredicateEvaluatorDefaults;
@@ -25,27 +25,29 @@ macro_rules! prim_array_cmp {
                     )?;
                 match $right_arr.data_type() {
                     ArrowDataType::List(_) => {
-                        eval_arrow_in_list(prim_array, $right_arr.as_list::<i32>())
+                        eval_arrow_in_list(prim_array, $right_arr.as_list::<i32>())?
                     },
                     ArrowDataType::LargeList(_) => {
-                        eval_arrow_in_list(prim_array, $right_arr.as_list::<i64>())
+                        eval_arrow_in_list(prim_array, $right_arr.as_list::<i64>())?
                     },
                     // TODO: LargeListView - not fully supported by arrow yet
                     _ => {
-                        Err(Error::invalid_expression(format!(
+                        return Err(Error::invalid_expression(format!(
                             "Expected right hand side to be list column, got: {:?}",
                             $right_arr.data_type()
-                        )))
+                        )));
                     }
                 }
             }
         )+
-            _ => Err(Error::invalid_expression(
-                format!("Bad Comparison between: {:?} and {:?}",
-                    $left_arr.data_type(),
-                    $right_arr.data_type())
-                )
-            )
+            _ => {
+                return Err(Error::invalid_expression(
+                    format!("Bad Comparison between: {:?} and {:?}",
+                        $left_arr.data_type(),
+                        $right_arr.data_type())
+                    )
+                );
+            }
         }
     }
 }
@@ -54,15 +56,20 @@ pub(super) fn eval_in_list(
     batch: &RecordBatch,
     left: &Expression,
     right: &Expression,
-) -> Result<Arc<dyn Array>, Error> {
+) -> Result<ArrayRef, Error> {
     use Expression::*;
 
-    match (left, right) {
-        (Literal(lit), Column(_)) => {
-            if lit.is_null() {
-                return Ok(Arc::new(BooleanArray::new_null(batch.num_rows())));
-            }
-
+    let result = match (left, right) {
+        (Literal(Scalar::Null(_)), Column(_) | Literal(Scalar::Array(_))) => {
+            // Searching any in-list for NULL always returns NULL -- no need to actually search
+            BooleanArray::new_null(batch.num_rows())
+        }
+        (Literal(lit), Literal(Scalar::Array(ad))) => {
+            // Search the literal in-list once and then replicate the returned single-row result
+            let exists = is_in_list(ad, Some(Some(lit.clone()))).iter().next();
+            BooleanArray::from(vec![exists.flatten(); batch.num_rows()])
+        }
+        (Literal(_), Column(_)) => {
             let right_arr = evaluate_expression(right, batch, None)?;
             let list_field = match right_arr.data_type() {
                 ArrowDataType::List(list_field) => list_field,
@@ -101,7 +108,7 @@ pub(super) fn eval_in_list(
                         _ => unreachable!(),
                     }
                     .map_err(Error::generic_err)?;
-                    return Ok(fix_arrow_in_list_result(result, right_arr.iter()));
+                    return Ok(Arc::new(fix_arrow_in_list_result(result, right_arr.iter())));
                 }
             }
 
@@ -118,25 +125,11 @@ pub(super) fn eval_in_list(
                 (ArrowDataType::Float16, Float16Type),
                 (ArrowDataType::Float32, Float32Type),
                 (ArrowDataType::Float64, Float64Type),
-                (ArrowDataType::Timestamp(TimeUnit::Second, _), TimestampSecondType),
-                (ArrowDataType::Timestamp(TimeUnit::Millisecond, _), TimestampMillisecondType),
                 (ArrowDataType::Timestamp(TimeUnit::Microsecond, _), TimestampMicrosecondType),
-                (ArrowDataType::Timestamp(TimeUnit::Nanosecond, _), TimestampNanosecondType),
                 (ArrowDataType::Date32, Date32Type),
-                (ArrowDataType::Date64, Date64Type),
                 (ArrowDataType::Time32(TimeUnit::Second), Time32SecondType),
                 (ArrowDataType::Time32(TimeUnit::Millisecond), Time32MillisecondType),
-                (ArrowDataType::Time64(TimeUnit::Microsecond), Time64MicrosecondType),
-                (ArrowDataType::Time64(TimeUnit::Nanosecond), Time64NanosecondType),
-                (ArrowDataType::Duration(TimeUnit::Second), DurationSecondType),
-                (ArrowDataType::Duration(TimeUnit::Millisecond), DurationMillisecondType),
-                (ArrowDataType::Duration(TimeUnit::Microsecond), DurationMicrosecondType),
-                (ArrowDataType::Duration(TimeUnit::Nanosecond), DurationNanosecondType),
-                (ArrowDataType::Interval(IntervalUnit::DayTime), IntervalDayTimeType),
-                (ArrowDataType::Interval(IntervalUnit::YearMonth), IntervalYearMonthType),
-                (ArrowDataType::Interval(IntervalUnit::MonthDayNano), IntervalMonthDayNanoType),
-                (ArrowDataType::Decimal128(_, _), Decimal128Type),
-                (ArrowDataType::Decimal256(_, _), Decimal256Type)
+                (ArrowDataType::Decimal128(_, _), Decimal128Type)
             }
         }
         (Column(name), Literal(Scalar::Array(ad))) => {
@@ -172,7 +165,7 @@ pub(super) fn eval_in_list(
                 })?;
 
             // safety: as_* methods on arrow arrays can panic, but we checked the data type before applying.
-            let arr = match (column.data_type(), data_type) {
+            match (column.data_type(), data_type) {
                 (ArrowDataType::Utf8, PrimitiveType::String) => {
                     is_in_list(ad, str_op(column.as_string::<i32>()))
                 }
@@ -235,18 +228,15 @@ pub(super) fn eval_in_list(
                         "Cannot check if value of type '{l}' is in array with value type '{r}'"
                     )))
                 }
-            };
-            Ok(wrap_comparison_result(arr))
+            }
         }
-        (Literal(lit), Literal(Scalar::Array(ad))) => {
-            let res = is_in_list(ad, Some(Some(lit.clone())));
-            let exists = res.is_valid(0).then(|| res.value(0));
-            Ok(Arc::new(BooleanArray::from(vec![exists; batch.num_rows()])))
+        (l, r) => {
+            return Err(Error::invalid_expression(format!(
+                "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
+            )));
         }
-        (l, r) => Err(Error::invalid_expression(format!(
-            "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
-        ))),
-    }
+    };
+    Ok(Arc::new(result))
 }
 
 fn is_in_list(ad: &ArrayData, values: impl IntoIterator<Item = Option<Scalar>>) -> BooleanArray {
@@ -274,23 +264,21 @@ fn is_in_list(ad: &ArrayData, values: impl IntoIterator<Item = Option<Scalar>>) 
 fn fix_arrow_in_list_result(
     results: BooleanArray,
     in_lists: impl IntoIterator<Item = Option<ArrayRef>>,
-) -> ArrayRef {
-    wrap_comparison_result(
-        results
-            .iter()
-            .zip(in_lists)
-            .map(|(res, arr)| match (res, arr) {
-                (Some(false), Some(arr)) if arr.null_count() > 0 => None,
-                _ => res,
-            })
-            .collect(),
-    )
+) -> BooleanArray {
+    results
+        .iter()
+        .zip(in_lists)
+        .map(|(res, arr)| match (res, arr) {
+            (Some(false), Some(arr)) if arr.null_count() > 0 => None,
+            _ => res,
+        })
+        .collect()
 }
 
 fn eval_arrow_in_list<T: ArrowNumericType, O: OffsetSizeTrait>(
     left: &PrimitiveArray<T>,
     right: &GenericListArray<O>,
-) -> DeltaResult<ArrayRef> {
+) -> DeltaResult<BooleanArray> {
     Ok(fix_arrow_in_list_result(
         in_list(left, right).map_err(Error::generic_err)?,
         right.iter(),
@@ -322,18 +310,15 @@ mod tests {
         .map(Some);
 
         let results = BooleanArray::from(vec![Some(false), Some(false)]);
-        let expected = Arc::new(BooleanArray::from(vec![None, Some(false)]));
+        let expected = BooleanArray::from(vec![None, Some(false)]);
         assert_eq!(
-            fix_arrow_in_list_result(results, in_lists.clone()).as_ref(),
-            expected.as_ref()
+            fix_arrow_in_list_result(results, in_lists.clone()),
+            expected
         );
 
         let results = BooleanArray::from(vec![Some(true), Some(true)]);
-        let expected = Arc::new(BooleanArray::from(vec![Some(true), Some(true)]));
-        assert_eq!(
-            fix_arrow_in_list_result(results, in_lists).as_ref(),
-            expected.as_ref()
-        );
+        let expected = BooleanArray::from(vec![Some(true), Some(true)]);
+        assert_eq!(fix_arrow_in_list_result(results, in_lists), expected);
     }
 
     #[test]
