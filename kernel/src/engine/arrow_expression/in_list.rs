@@ -2,14 +2,14 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::*;
+use arrow_array::{types::*, ArrowNumericType, GenericListArray, OffsetSizeTrait, PrimitiveArray};
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow_cast::cast;
 use arrow_ord::comparison::{in_list, in_list_utf8};
 use arrow_schema::{DataType as ArrowDataType, IntervalUnit, TimeUnit};
 
 use super::{evaluate_expression, extract_column, wrap_comparison_result};
-use crate::error::Error;
+use crate::error::{DeltaResult, Error};
 use crate::expressions::{ArrayData, Expression, Scalar, VariadicOperator};
 use crate::predicates::PredicateEvaluatorDefaults;
 use crate::schema::PrimitiveType;
@@ -25,18 +25,10 @@ macro_rules! prim_array_cmp {
                     )?;
                 match $right_arr.data_type() {
                     ArrowDataType::List(_) => {
-                        let list_array = $right_arr.as_list::<i32>();
-                        Ok(fix_arrow_in_list_result(
-                            in_list(prim_array, &list_array).map_err(Error::generic_err)?,
-                            list_array.iter(),
-                        ))
+                        eval_arrow_in_list(prim_array, $right_arr.as_list::<i32>())
                     },
                     ArrowDataType::LargeList(_) => {
-                        let list_array = $right_arr.as_list::<i64>();
-                        Ok(fix_arrow_in_list_result(
-                            in_list(prim_array, &list_array).map_err(Error::generic_err)?,
-                            list_array.iter(),
-                        ))
+                        eval_arrow_in_list(prim_array, $right_arr.as_list::<i64>())
                     },
                     // TODO: LargeListView - not fully supported by arrow yet
                     _ => {
@@ -293,6 +285,16 @@ fn fix_arrow_in_list_result(
             })
             .collect(),
     )
+}
+
+fn eval_arrow_in_list<T: ArrowNumericType, O: OffsetSizeTrait>(
+    left: &PrimitiveArray<T>,
+    right: &GenericListArray<O>,
+) -> DeltaResult<ArrayRef> {
+    Ok(fix_arrow_in_list_result(
+        in_list(left, right).map_err(Error::generic_err)?,
+        right.iter(),
+    ))
 }
 
 #[cfg(test)]
