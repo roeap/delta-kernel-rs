@@ -104,10 +104,10 @@ pub(super) fn eval_in_list(
                 values.into_iter().map(|v| v.map(|v| v.into()))
             }
 
-            fn to_scalars<'a, T: ArrowPrimitiveType>(
-                values: &'a PrimitiveArray<T>,
+            fn to_scalars<T: ArrowPrimitiveType>(
+                values: &PrimitiveArray<T>,
                 from: fn(T::Native) -> Scalar,
-            ) -> impl IntoIterator<Item = Option<Scalar>> + 'a {
+            ) -> impl IntoIterator<Item = Option<Scalar>> + '_ {
                 values.iter().map(move |v| v.map(from))
             }
 
