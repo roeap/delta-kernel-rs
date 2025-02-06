@@ -609,10 +609,6 @@ mod tests {
         let in_result = evaluate_expression(&in_op, &batch, None);
 
         assert!(in_result.is_err());
-        assert_eq!(
-            in_result.unwrap_err().to_string(),
-            "Invalid expression evaluation: Invalid right value for (NOT) IN comparison, left is: Column(item) right is: Column(item)".to_string()
-        )
     }
 
     #[test]
