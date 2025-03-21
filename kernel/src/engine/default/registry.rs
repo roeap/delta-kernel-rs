@@ -23,12 +23,16 @@ impl std::fmt::Debug for DefaultObjectStoreRegistry {
             .field(
                 "schemes",
                 &self
-                    .object_stores
-                    .iter()
-                    .map(|(key, _)| key.clone())
+                    .object_stores.keys().cloned()
                     .collect::<Vec<_>>(),
             )
             .finish()
+    }
+}
+
+impl Default for DefaultObjectStoreRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

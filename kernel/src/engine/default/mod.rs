@@ -133,15 +133,13 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     }
 }
 
-pub(self) trait UrlExt {
+trait UrlExt {
     fn is_presigned(&self) -> bool;
 }
 
 impl UrlExt for Url {
     fn is_presigned(&self) -> bool {
-        self.query_pairs()
-            .find(|(key, _)| key == "AWSAccessKeyId")
-            .is_some()
+        matches!(self.scheme(), "http" | "https") && self.query().is_some()
     }
 }
 
