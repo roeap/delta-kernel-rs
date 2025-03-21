@@ -54,12 +54,16 @@ mod tests {
             .map(|i| delta_path_for_version(i, "json"))
             .collect_vec();
 
+        dbg!(&expected_names);
+
         for i in expected_names.iter().rev() {
             let path = base_url.join(i.as_ref()).unwrap();
             json.write_json_file(&path, get_data(), false).unwrap();
         }
         let path = base_url.join("other").unwrap();
         json.write_json_file(&path, get_data(), false).unwrap();
+
+        dbg!("after json write");
 
         let fs = engine.get_file_system_client();
 
@@ -71,11 +75,15 @@ mod tests {
             assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
         }
 
+        dbg!("after list");
+
         let test_url = base_url
             .join(delta_path_for_version(0, "json").as_ref())
             .unwrap();
         let files: Vec<_> = fs.list_from(&test_url).unwrap().try_collect().unwrap();
         assert_eq!(files.len(), expected_names.len());
+
+        dbg!("after list");
 
         // list files inside a directory / key prefix
         let test_url = base_url.join("_delta_log/").unwrap();

@@ -4,23 +4,24 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use futures::StreamExt;
+use object_store::path::Path;
+use uuid::Uuid;
+
+use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
+use super::ObjectStoreRegistry;
+use super::UrlExt;
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
+use crate::engine::default::executor::TaskExecutor;
+use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use futures::StreamExt;
-use object_store::path::Path;
-use object_store::DynObjectStore;
-use uuid::Uuid;
-
-use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
-use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
-use crate::engine::default::executor::TaskExecutor;
-use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, ExpressionRef, FileDataReadResultIterator, FileMeta,
@@ -29,7 +30,7 @@ use crate::{
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
-    store: Arc<DynObjectStore>,
+    registry: Arc<dyn ObjectStoreRegistry>,
     task_executor: Arc<E>,
     readahead: usize,
 }
@@ -93,9 +94,9 @@ impl DataFileMetadata {
 }
 
 impl<E: TaskExecutor> DefaultParquetHandler<E> {
-    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub fn new(registry: Arc<dyn ObjectStoreRegistry>, task_executor: Arc<E>) -> Self {
         Self {
-            store,
+            registry,
             task_executor,
             readahead: 10,
         }
@@ -138,11 +139,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         }
         let path = path.join(&name)?;
 
-        self.store
-            .put(&Path::from(path.path()), buffer.into())
-            .await?;
+        let (store, _) = self.registry.get_store(&path)?;
+        store.put(&Path::from(path.path()), buffer.into()).await?;
 
-        let metadata = self.store.head(&Path::from(path.path())).await?;
+        let metadata = store.head(&Path::from(path.path())).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
         if size != metadata.size {
             return Err(Error::generic(format!(
@@ -184,25 +184,23 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         }
 
         // get the first FileMeta to decide how to fetch the file.
-        // NB: This means that every file in `FileMeta` _must_ have the same scheme or things will break
-        // s3://    -> aws   (ParquetOpener)
-        // nothing  -> local (ParquetOpener)
-        // https:// -> assume presigned URL (and fetch without object_store)
-        //   -> reqwest to get data
-        //   -> parse to parquet
+        // NB: This means that every file in `FileMeta` _must_ have the same scheme and host or things will break
+        // if a query is present, we use a presigned URL opener, otherwise we use a parquet opener.
+        // Urls can either be http(s), file, or use cloud storage schemes like s3, gcs, etc.
         // SAFETY: we did is_empty check above, this is ok.
-        let file_opener: Box<dyn FileOpener> = match files[0].location.scheme() {
-            "http" | "https" => Box::new(PresignedUrlOpener::new(
+        let file_opener: Box<dyn FileOpener> = if files[0].location.is_presigned() {
+            Box::new(PresignedUrlOpener::new(
                 1024,
                 physical_schema.clone(),
                 predicate,
-            )),
-            _ => Box::new(ParquetOpener::new(
+            ))
+        } else {
+            Box::new(ParquetOpener::new(
                 1024,
                 physical_schema.clone(),
                 predicate,
-                self.store.clone(),
-            )),
+                self.registry.clone(),
+            ))
         };
         FileStream::new_async_read_iterator(
             self.task_executor.clone(),
@@ -216,12 +214,11 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
 /// Implements [`FileOpener`] for a parquet file
 struct ParquetOpener {
-    // projection: Arc<[usize]>,
     batch_size: usize,
     table_schema: SchemaRef,
     predicate: Option<ExpressionRef>,
     limit: Option<usize>,
-    store: Arc<DynObjectStore>,
+    registry: Arc<dyn ObjectStoreRegistry>,
 }
 
 impl ParquetOpener {
@@ -229,14 +226,14 @@ impl ParquetOpener {
         batch_size: usize,
         table_schema: SchemaRef,
         predicate: Option<ExpressionRef>,
-        store: Arc<DynObjectStore>,
+        registry: Arc<dyn ObjectStoreRegistry>,
     ) -> Self {
         Self {
             batch_size,
             table_schema,
             predicate,
             limit: None,
-            store,
+            registry,
         }
     }
 }
@@ -244,7 +241,7 @@ impl ParquetOpener {
 impl FileOpener for ParquetOpener {
     fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
         let path = Path::from_url_path(file_meta.location.path())?;
-        let store = self.store.clone();
+        let store = self.registry.get_store(&file_meta.location)?.0;
 
         let batch_size = self.batch_size;
         // let projection = self.projection.clone();
@@ -361,17 +358,16 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::arrow::array::{Array, RecordBatch};
-    use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
+    use itertools::Itertools;
+    use object_store::ObjectStore;
     use url::Url;
 
+    use super::*;
+    use crate::arrow::array::{Array, RecordBatch};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::engine::default::DefaultObjectStoreRegistry;
     use crate::EngineData;
-
-    use itertools::Itertools;
-
-    use super::*;
 
     fn into_record_batch(
         engine_data: DeltaResult<Box<dyn EngineData>>,
@@ -383,7 +379,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_parquet_files() {
-        let store = Arc::new(LocalFileSystem::new());
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let (store, _) = registry
+            .get_store(&Url::parse("file:///").unwrap())
+            .unwrap();
 
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
@@ -405,7 +405,7 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultParquetHandler::new(registry, exec);
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
             .unwrap()
@@ -469,9 +469,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_parquet() {
-        let store = Arc::new(InMemory::new());
-        let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let exec = Arc::new(TokioBackgroundExecutor::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
+        let (store, _) = registry
+            .get_store(&Url::parse("memory:///").unwrap())
+            .unwrap();
+        let parquet_handler = DefaultParquetHandler::new(registry.clone(), exec);
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -540,9 +543,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_disallow_non_trailing_slash() {
-        let store = Arc::new(InMemory::new());
+        let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
         let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+            DefaultParquetHandler::new(registry.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
