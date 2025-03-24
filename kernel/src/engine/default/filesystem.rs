@@ -126,8 +126,6 @@ impl<E: TaskExecutor> FileSystemClient for ObjectStoreFileSystemClient<E> {
                     };
                     let registry = registry.clone();
                     async move {
-                        // if the url is a pre-sgned url, we can directly download the file
-                        // TODO(packre): is checking if a query is set sufficient?
                         if url.is_presigned() {
                             // have to annotate type here or rustc can't figure it out
                             Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
