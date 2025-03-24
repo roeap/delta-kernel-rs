@@ -72,7 +72,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// # Parameters
     ///
     /// - `registry`: An object store registry. See [`ObjectStoreRegistry`].
-    /// - `task_executor`: Used to spawn async IO tasks. See [TaskExecutor](executor::TaskExecutor).
+    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
     pub fn new(registry: Arc<dyn ObjectStoreRegistry>, task_executor: Arc<E>) -> Self {
         Self {
             file_system: Arc::new(ObjectStoreFileSystemClient::new(

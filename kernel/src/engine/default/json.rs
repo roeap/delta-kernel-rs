@@ -484,9 +484,6 @@ mod tests {
     fn test_parse_json() {
         let exec = Arc::new(TokioBackgroundExecutor::new());
         let registry = Arc::new(DefaultObjectStoreRegistry::new_test());
-        // let store = registry
-        //     .get_store(&Url::parse("file:///").unwrap())
-        //     .unwrap();
         let handler = DefaultJsonHandler::new(registry, exec);
 
         let json_strings = StringArray::from(vec![

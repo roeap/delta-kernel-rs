@@ -22,9 +22,7 @@ impl std::fmt::Debug for DefaultObjectStoreRegistry {
         f.debug_struct("DefaultObjectStoreRegistry")
             .field(
                 "schemes",
-                &self
-                    .object_stores.keys().cloned()
-                    .collect::<Vec<_>>(),
+                &self.object_stores.keys().cloned().collect::<Vec<_>>(),
             )
             .finish()
     }
