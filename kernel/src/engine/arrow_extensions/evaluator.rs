@@ -11,7 +11,7 @@ pub trait ExpressionEvaluatorExt {
 impl<T: ExpressionEvaluator + ?Sized> ExpressionEvaluatorExt for T {
     fn evaluate_arrow(&self, batch: RecordBatch) -> DeltaResult<RecordBatch> {
         let engine_data = ArrowEngineData::new(batch);
-        Ok(ArrowEngineData::try_from_engine_data(T::evaluate(&self, &engine_data)?)?.into())
+        Ok(ArrowEngineData::try_from_engine_data(T::evaluate(self, &engine_data)?)?.into())
     }
 }
 
