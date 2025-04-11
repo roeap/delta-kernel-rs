@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use crate::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, RecordBatch,
-    StringArray, StructArray, TimestampMicrosecondArray,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapBuilder,
+    RecordBatch, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
 };
 use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::concat;
@@ -27,6 +27,8 @@ use evaluate_expression::evaluate_expression;
 
 mod apply_schema;
 mod evaluate_expression;
+
+pub use evaluate_expression::ProvidesColumnByName;
 
 #[cfg(test)]
 mod tests;
@@ -113,9 +115,13 @@ impl Scalar {
                 Arc::new(ListArray::new_null(Arc::new(field), num_rows))
             }
             Null(DataType::Map { .. }) => {
-                return Err(Error::unsupported(
-                    "Scalar::to_array does not yet support Map types",
-                ));
+                let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+                let mut count = 0;
+                while count < num_rows {
+                    builder.append(false)?;
+                    count += 1;
+                }
+                Arc::new(builder.finish())
             }
         };
         Ok(arr)

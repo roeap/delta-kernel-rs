@@ -10,12 +10,14 @@ use crate::{
 pub(crate) use crate::actions::visitors::SetTransactionMap;
 
 #[allow(dead_code)]
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) struct SetTransactionScanner {
     snapshot: Arc<Snapshot>,
 }
 
 #[allow(dead_code)]
 impl SetTransactionScanner {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn new(snapshot: Arc<Snapshot>) -> Self {
         SetTransactionScanner { snapshot }
     }
@@ -71,6 +73,7 @@ impl SetTransactionScanner {
     }
 
     /// Scan the Delta Log for the latest transaction entry of an application
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn application_transaction(
         &self,
         engine: &dyn Engine,
@@ -81,6 +84,7 @@ impl SetTransactionScanner {
     }
 
     /// Scan the Delta Log to obtain the latest transaction for all applications
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     pub(crate) fn application_transactions(
         &self,
         engine: &dyn Engine,

@@ -361,6 +361,7 @@ impl RowVisitor for CdcVisitor {
     }
 }
 
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 pub(crate) type SetTransactionMap = HashMap<String, SetTransaction>;
 
 /// Extract application transaction actions from the log into a map

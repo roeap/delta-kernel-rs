@@ -31,6 +31,7 @@ fn wrap_comparison_result(arr: BooleanArray) -> ArrayRef {
     Arc::new(arr) as _
 }
 
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 trait ProvidesColumnByName {
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
 }
@@ -112,6 +113,10 @@ pub(crate) fn evaluate_expression(
             let result = StructArray::try_new(output_fields.into(), output_cols, None)?;
             Ok(Arc::new(result))
         }
+        (Struct(_), Some(dt)) => Err(Error::Generic(format!(
+            "Data type mismatch, expected struct but got {:?}",
+            dt,
+        ))),
         (Struct(_), _) => Err(Error::generic(
             "Data type is required to evaluate struct expressions",
         )),

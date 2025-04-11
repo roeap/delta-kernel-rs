@@ -6,7 +6,7 @@ use crate::arrow::record_batch::RecordBatch;
 use itertools::Itertools;
 
 use crate::scan::{Scan, ScanMetadata, ScanResult};
-use crate::{DeltaResult, Engine, Error, ExpressionRef};
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef, Version};
 
 use super::super::arrow_data::ArrowEngineData;
 
@@ -69,6 +69,13 @@ pub trait ScanExt {
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadataArrow>>>;
 
+    fn scan_metadata_from_existing_arrow(
+        &self,
+        engine: &dyn Engine,
+        hint_version: Version,
+        hint_data: impl IntoIterator<Item = RecordBatch> + 'static,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadataArrow>>>;
+
     fn execute_arrow(
         &self,
         engine: Arc<dyn Engine>,
@@ -82,6 +89,24 @@ impl ScanExt for Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadataArrow>>> {
         Ok(self
             .scan_metadata(engine)?
+            .map_ok(TryFrom::try_from)
+            .flatten())
+    }
+
+    fn scan_metadata_from_existing_arrow(
+        &self,
+        engine: &dyn Engine,
+        hint_version: Version,
+        hint_data: impl IntoIterator<Item = RecordBatch> + 'static,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadataArrow>>> {
+        Ok(self
+            .scan_metadata_from_existing(
+                engine,
+                hint_version,
+                hint_data
+                    .into_iter()
+                    .map(|b| Box::new(ArrowEngineData::new(b)) as Box<dyn EngineData>),
+            )?
             .map_ok(TryFrom::try_from)
             .flatten())
     }

@@ -76,7 +76,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         //   shows you how to list the [objects](https://cloud.google.com/storage/docs/objects) stored
         //   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
         // So we just need to know if we're local and then if so, we sort the returned file list
-        let has_ordered_listing = path.scheme() != "file";
+        let has_ordered_listing = path.scheme() != "file" && path.scheme() != "memory";
 
         // This channel will become the iterator
         let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);

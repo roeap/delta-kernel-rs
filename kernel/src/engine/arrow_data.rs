@@ -124,6 +124,7 @@ impl EngineMap for MapArray {
 
 /// Helper trait that provides uniform access to columns and fields, so that our row visitor can use
 /// the same code to drill into a `RecordBatch` (initial case) or `StructArray` (nested case).
+#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
 trait ProvidesColumnsAndFields {
     fn columns(&self) -> &[ArrayRef];
     fn fields(&self) -> &[FieldRef];
@@ -193,6 +194,7 @@ impl EngineData for ArrowEngineData {
 }
 
 impl ArrowEngineData {
+    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
     fn extract_columns<'a>(
         path: &mut Vec<String>,
         getters: &mut Vec<&'a dyn GetData<'a>>,
