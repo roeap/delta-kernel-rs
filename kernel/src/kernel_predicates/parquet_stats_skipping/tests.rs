@@ -1,6 +1,6 @@
 use super::*;
 use crate::expressions::{column_expr, Expression as Expr};
-use crate::predicates::PredicateEvaluator as _;
+use crate::kernel_predicates::KernelPredicateEvaluator as _;
 use crate::DataType;
 
 const TRUE: Option<bool> = Some(true);
@@ -40,10 +40,10 @@ impl ParquetStatsProvider for UnimplementedTestFilter {
     }
 }
 
-/// Tests apply_variadic and apply_scalar
+/// Tests apply_junction and apply_scalar
 #[test]
 fn test_junctions() {
-    use VariadicOperator::*;
+    use JunctionOperator::*;
 
     let test_cases = &[
         // Every combo of 0, 1 and 2 inputs
@@ -99,22 +99,22 @@ fn test_junctions() {
             .collect();
 
         expect_eq!(
-            filter.eval_variadic(And, &inputs, false),
+            filter.eval_junction(And, &inputs, false),
             *expect_and,
             "AND({inputs:?})"
         );
         expect_eq!(
-            filter.eval_variadic(Or, &inputs, false),
+            filter.eval_junction(Or, &inputs, false),
             *expect_or,
             "OR({inputs:?})"
         );
         expect_eq!(
-            filter.eval_variadic(And, &inputs, true),
+            filter.eval_junction(And, &inputs, true),
             expect_and.map(|val| !val),
             "NOT(AND({inputs:?}))"
         );
         expect_eq!(
-            filter.eval_variadic(Or, &inputs, true),
+            filter.eval_junction(Or, &inputs, true),
             expect_or.map(|val| !val),
             "NOT(OR({inputs:?}))"
         );
@@ -161,12 +161,12 @@ fn test_eval_binary_comparisons() {
     const NULL_VAL: Scalar = Scalar::Null(DataType::INTEGER);
 
     let expressions = [
-        Expr::lt(column_expr!("x"), 10),
-        Expr::le(column_expr!("x"), 10),
-        Expr::eq(column_expr!("x"), 10),
-        Expr::ne(column_expr!("x"), 10),
-        Expr::gt(column_expr!("x"), 10),
-        Expr::ge(column_expr!("x"), 10),
+        Expr::lt(column_expr!("x"), Expr::literal(10)),
+        Expr::le(column_expr!("x"), Expr::literal(10)),
+        Expr::eq(column_expr!("x"), Expr::literal(10)),
+        Expr::ne(column_expr!("x"), Expr::literal(10)),
+        Expr::gt(column_expr!("x"), Expr::literal(10)),
+        Expr::ge(column_expr!("x"), Expr::literal(10)),
     ];
 
     let do_test = |min: Scalar, max: Scalar, expected: &[Option<bool>]| {
@@ -230,7 +230,7 @@ impl ParquetStatsProvider for NullCountTestFilter {
 fn test_eval_is_null() {
     let expressions = [
         Expr::is_null(column_expr!("x")),
-        !Expr::is_null(column_expr!("x")),
+        Expr::is_not_null(column_expr!("x")),
     ];
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {

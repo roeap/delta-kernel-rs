@@ -1,18 +1,18 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::{types::*, ArrowNumericType, PrimitiveArray};
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
-use arrow_cast::cast;
-use arrow_ord::comparison::{in_list, in_list_utf8};
-use arrow_schema::{DataType as ArrowDataType, TimeUnit};
+use crate::arrow::array::cast::AsArray;
+use crate::arrow::array::{types::*, ArrowNumericType, PrimitiveArray};
+use crate::arrow::array::{Array, ArrayRef, BooleanArray, GenericListArray, RecordBatch};
+use crate::arrow::compute::cast;
+use crate::arrow::compute::{in_list, in_list_utf8};
+use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 use paste::paste;
 
-use super::{evaluate_expression, extract_column};
+use super::evaluate_expression::{evaluate_expression, extract_column};
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{ArrayData, Expression, Scalar, VariadicOperator};
-use crate::predicates::PredicateEvaluatorDefaults;
+use crate::expressions::{ArrayData, Expression, JunctionOperator, Scalar};
+use crate::kernel_predicates::KernelPredicateEvaluatorDefaults;
 use crate::schema::PrimitiveType;
 
 pub(super) fn eval_in_list(
@@ -221,8 +221,8 @@ fn is_in_list(ad: &ArrayData, values: impl IntoIterator<Item = Option<Scalar>>) 
     values
         .into_iter()
         .map(|v| {
-            PredicateEvaluatorDefaults::finish_eval_variadic(
-                VariadicOperator::Or,
+            KernelPredicateEvaluatorDefaults::finish_eval_junction(
+                JunctionOperator::Or,
                 inlist
                     .iter()
                     .map(|k| Some(v.as_ref()?.partial_cmp(k)? == Ordering::Equal)),
@@ -251,7 +251,7 @@ fn fix_arrow_in_list_result(
 
 fn eval_arrow_utf8(
     left_arr: &dyn Array,
-    right_arr: &arrow_array::GenericListArray<i32>,
+    right_arr: &GenericListArray<i32>,
 ) -> Result<BooleanArray, Error> {
     let result = match left_arr.data_type() {
         ArrowDataType::Utf8 => in_list_utf8(left_arr.as_string::<i32>(), right_arr),
@@ -291,13 +291,13 @@ fn eval_arrow<T: ArrowNumericType>(
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{
+    use crate::arrow::array::{
         BinaryArray, BinaryViewArray, Date32Array, Float32Array, Float64Array, Int16Array,
         Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeListArray, LargeStringArray,
         ListArray, StringArray, StringViewArray, TimestampMicrosecondArray,
     };
-    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-    use arrow_schema::Field;
+    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+    use crate::arrow::datatypes::Field;
 
     use super::*;
     use crate::{
@@ -358,7 +358,7 @@ mod tests {
             ArrowDataType::LargeList(field.clone()),
             true,
         ));
-        let schema = arrow_schema::Schema::new([arr_field.clone()]);
+        let schema = crate::arrow::datatypes::Schema::new([arr_field.clone()]);
         let array = LargeListArray::new(field.clone(), offsets, Arc::new(values), None);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
 
@@ -505,7 +505,7 @@ mod tests {
 
         for (data_type, values, list_value) in cases {
             let field = Arc::new(Field::new("item", values.data_type().clone(), true));
-            let schema = arrow_schema::Schema::new([field.clone()]);
+            let schema = crate::arrow::datatypes::Schema::new([field.clone()]);
             let batch = RecordBatch::try_new(Arc::new(schema), vec![values.clone()]).unwrap();
 
             // test "col IN (lit1, lit2, ...)"
@@ -520,7 +520,7 @@ mod tests {
             // test "lit IN (col)"
             let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2, 3]));
             let list_field = Arc::new(Field::new("item", ArrowDataType::List(field.clone()), true));
-            let schema = arrow_schema::Schema::new([list_field.clone()]);
+            let schema = crate::arrow::datatypes::Schema::new([list_field.clone()]);
             let array = ListArray::new(field.clone(), offsets, values.clone(), None);
             let batch =
                 RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
@@ -541,7 +541,11 @@ mod tests {
 
     #[test]
     fn test_eval_in_list_lit_in_lit() {
-        let dummy = arrow_schema::Schema::new(vec![Field::new("a", ArrowDataType::Boolean, true)]);
+        let dummy = crate::arrow::datatypes::Schema::new(vec![Field::new(
+            "a",
+            ArrowDataType::Boolean,
+            true,
+        )]);
         let dummy_batch =
             RecordBatch::try_new(Arc::new(dummy), vec![Arc::new(BooleanArray::new_null(1))])
                 .unwrap();

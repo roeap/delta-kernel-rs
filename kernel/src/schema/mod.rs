@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) use crate::expressions::{column_name, ColumnName};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
+use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
 
@@ -22,7 +23,7 @@ pub type SchemaRef = Arc<StructType>;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(untagged)]
 pub enum MetadataValue {
-    Number(i32),
+    Number(i64),
     String(String),
     Boolean(bool),
     // The [PROTOCOL](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#struct-field) states
@@ -32,8 +33,8 @@ pub enum MetadataValue {
     Other(serde_json::Value),
 }
 
-impl std::fmt::Display for MetadataValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for MetadataValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             MetadataValue::Number(n) => write!(f, "{n}"),
             MetadataValue::String(s) => write!(f, "{s}"),
@@ -61,8 +62,8 @@ impl From<&str> for MetadataValue {
     }
 }
 
-impl From<i32> for MetadataValue {
-    fn from(value: i32) -> Self {
+impl From<i64> for MetadataValue {
+    fn from(value: i64) -> Self {
         Self::Number(value)
     }
 }
@@ -226,6 +227,11 @@ impl StructField {
             .unwrap()
             .into_owned()
     }
+
+    fn has_invariants(&self) -> bool {
+        self.metadata
+            .contains_key(ColumnMetadataKey::Invariants.as_ref())
+    }
 }
 
 /// A struct is used to represent both the top-level schema of the table
@@ -286,13 +292,23 @@ impl StructType {
         self.fields.values()
     }
 
+    pub(crate) fn fields_len(&self) -> usize {
+        // O(1) for indexmap
+        self.fields.len()
+    }
+
+    // Checks if the `StructType` contains a field with the specified name.
+    pub(crate) fn contains(&self, name: impl AsRef<str>) -> bool {
+        self.fields.contains_key(name.as_ref())
+    }
+
     /// Extracts the name and type of all leaf columns, in schema order. Caller should pass Some
     /// `own_name` if this schema is embedded in a larger struct (e.g. `add.*`) and None if the
     /// schema is a top-level result (e.g. `*`).
     ///
     /// NOTE: This method only traverses through `StructType` fields; `MapType` and `ArrayType`
     /// fields are considered leaves even if they contain `StructType` entries/elements.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn leaves<'s>(&self, own_name: impl Into<Option<&'s str>>) -> ColumnNamesAndTypes {
         let mut get_leaves = GetSchemaLeaves::new(own_name.into());
         let _ = get_leaves.transform_struct(self);
@@ -300,12 +316,40 @@ impl StructType {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct InvariantChecker {
+    has_invariants: bool,
+}
+
+impl<'a> SchemaTransform<'a> for InvariantChecker {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        if field.has_invariants() {
+            self.has_invariants = true;
+        } else if !self.has_invariants {
+            let _ = self.recurse_into_struct_field(field);
+        }
+        Some(Cow::Borrowed(field))
+    }
+}
+
+impl InvariantChecker {
+    /// Checks if any column in the schema (including nested columns) has invariants defined.
+    ///
+    /// This traverses the entire schema to check for the presence of the "delta.invariants"
+    /// metadata key.
+    pub(crate) fn has_invariants(schema: &Schema) -> bool {
+        let mut checker = InvariantChecker::default();
+        let _ = checker.transform_struct(schema);
+        checker.has_invariants
+    }
+}
+
 /// Helper for RowVisitor implementations
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 #[derive(Clone, Default)]
 pub(crate) struct ColumnNamesAndTypes(Vec<ColumnName>, Vec<DataType>);
 impl ColumnNamesAndTypes {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn as_ref(&self) -> (&[ColumnName], &[DataType]) {
         (&self.0, &self.1)
     }
@@ -443,6 +487,40 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DecimalType {
+    precision: u8,
+    scale: u8,
+}
+
+impl DecimalType {
+    /// Check if the given precision and scale are valid for a decimal type.
+    pub fn try_new(precision: u8, scale: u8) -> DeltaResult<Self> {
+        require!(
+            0 < precision && precision <= 38,
+            Error::invalid_decimal(format!(
+                "precision must be in range 1..38 inclusive, found: {}.",
+                precision
+            ))
+        );
+        require!(
+            scale <= precision,
+            Error::invalid_decimal(format!(
+                "scale must be in range 0..{precision} inclusive, found: {scale}."
+            ))
+        );
+        Ok(Self { precision, scale })
+    }
+
+    pub fn precision(&self) -> u8 {
+        self.precision
+    }
+
+    pub fn scale(&self) -> u8 {
+        self.scale
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PrimitiveType {
@@ -473,18 +551,23 @@ pub enum PrimitiveType {
         deserialize_with = "deserialize_decimal",
         untagged
     )]
-    Decimal(u8, u8),
+    Decimal(DecimalType),
+}
+
+impl PrimitiveType {
+    pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
+        Ok(DecimalType::try_new(precision, scale)?.into())
+    }
 }
 
 fn serialize_decimal<S: serde::Serializer>(
-    precision: &u8,
-    scale: &u8,
+    dtype: &DecimalType,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&format!("decimal({},{})", precision, scale))
+    serializer.serialize_str(&format!("decimal({},{})", dtype.precision(), dtype.scale()))
 }
 
-fn deserialize_decimal<'de, D>(deserializer: D) -> Result<(u8, u8), D::Error>
+fn deserialize_decimal<'de, D>(deserializer: D) -> Result<DecimalType, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -507,8 +590,7 @@ where
         .ok_or_else(|| {
             serde::de::Error::custom(format!("Invalid scale in decimal: {}", str_value))
         })?;
-    PrimitiveType::check_decimal(precision, scale).map_err(serde::de::Error::custom)?;
-    Ok((precision, scale))
+    DecimalType::try_new(precision, scale).map_err(serde::de::Error::custom)
 }
 
 impl Display for PrimitiveType {
@@ -526,8 +608,8 @@ impl Display for PrimitiveType {
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Timestamp => write!(f, "timestamp"),
             PrimitiveType::TimestampNtz => write!(f, "timestamp_ntz"),
-            PrimitiveType::Decimal(precision, scale) => {
-                write!(f, "decimal({},{})", precision, scale)
+            PrimitiveType::Decimal(dtype) => {
+                write!(f, "decimal({},{})", dtype.precision(), dtype.scale())
             }
         }
     }
@@ -548,6 +630,16 @@ pub enum DataType {
     Map(Box<MapType>),
 }
 
+impl From<DecimalType> for PrimitiveType {
+    fn from(dtype: DecimalType) -> Self {
+        PrimitiveType::Decimal(dtype)
+    }
+}
+impl From<DecimalType> for DataType {
+    fn from(dtype: DecimalType) -> Self {
+        PrimitiveType::from(dtype).into()
+    }
+}
 impl From<PrimitiveType> for DataType {
     fn from(ptype: PrimitiveType) -> Self {
         DataType::Primitive(ptype)
@@ -593,10 +685,7 @@ impl DataType {
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
 
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
-        PrimitiveType::check_decimal(precision, scale)?;
-        Ok(DataType::Primitive(PrimitiveType::Decimal(
-            precision, scale,
-        )))
+        Ok(PrimitiveType::decimal(precision, scale)?.into())
     }
 
     // This function assumes that the caller has already checked the precision and scale
@@ -996,10 +1085,7 @@ mod tests {
         }
         "#;
         let field: StructField = serde_json::from_str(data).unwrap();
-        assert!(matches!(
-            field.data_type,
-            DataType::Primitive(PrimitiveType::Decimal(10, 2))
-        ));
+        assert_eq!(field.data_type, DataType::decimal(10, 2).unwrap());
 
         let json_str = serde_json::to_string(&field).unwrap();
         assert_eq!(
@@ -1034,16 +1120,22 @@ mod tests {
             "nullable": true,
             "metadata": {
                 "delta.columnMapping.id": 4,
-                "delta.columnMapping.physicalName": "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
+                "delta.columnMapping.physicalName": "col-5f422f40-de70-45b2-88ab-1d5c90e94db1",
+                "delta.identity.start": 2147483648
             }
         }
         "#;
+
         let field: StructField = serde_json::from_str(data).unwrap();
 
         let col_id = field
             .get_config_value(&ColumnMetadataKey::ColumnMappingId)
             .unwrap();
+        let id_start = field
+            .get_config_value(&ColumnMetadataKey::IdentityStart)
+            .unwrap();
         assert!(matches!(col_id, MetadataValue::Number(num) if *num == 4));
+        assert!(matches!(id_start, MetadataValue::Number(num) if *num == 2147483648i64));
         assert_eq!(
             field.physical_name(),
             "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
@@ -1202,5 +1294,112 @@ mod tests {
             MetadataValue::Other(array_json).to_string(),
             "[\"an\",\"array\"]"
         );
+    }
+
+    #[test]
+    fn test_fields_len() {
+        let schema = StructType::new([]);
+        assert!(schema.fields_len() == 0);
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::LONG),
+            StructField::nullable("b", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+            StructField::nullable("d", DataType::LONG),
+        ]);
+        assert_eq!(schema.fields_len(), 4);
+        let schema = StructType::new([
+            StructField::nullable("b", DataType::LONG),
+            StructField::not_null("b", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+            StructField::nullable("c", DataType::LONG),
+        ]);
+        assert_eq!(schema.fields_len(), 2);
+    }
+
+    #[test]
+    fn test_has_invariants() {
+        // Schema with no invariants
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+        ]);
+        assert!(!InvariantChecker::has_invariants(&schema));
+
+        // Schema with top-level invariant
+        let mut field = StructField::nullable("c", DataType::STRING);
+        field.metadata.insert(
+            ColumnMetadataKey::Invariants.as_ref().to_string(),
+            MetadataValue::String("c > 0".to_string()),
+        );
+
+        let schema = StructType::new([StructField::nullable("a", DataType::STRING), field]);
+        assert!(InvariantChecker::has_invariants(&schema));
+
+        // Schema with nested invariant in a struct
+        let nested_field = StructField::nullable(
+            "nested_c",
+            DataType::struct_type([{
+                let mut field = StructField::nullable("d", DataType::INTEGER);
+                field.metadata.insert(
+                    ColumnMetadataKey::Invariants.as_ref().to_string(),
+                    MetadataValue::String("d > 0".to_string()),
+                );
+                field
+            }]),
+        );
+
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            nested_field,
+        ]);
+        assert!(InvariantChecker::has_invariants(&schema));
+
+        // Schema with nested invariant in an array of structs
+        let array_field = StructField::nullable(
+            "array_field",
+            ArrayType::new(
+                DataType::struct_type([{
+                    let mut field = StructField::nullable("d", DataType::INTEGER);
+                    field.metadata.insert(
+                        ColumnMetadataKey::Invariants.as_ref().to_string(),
+                        MetadataValue::String("d > 0".to_string()),
+                    );
+                    field
+                }]),
+                true,
+            ),
+        );
+
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            array_field,
+        ]);
+        assert!(InvariantChecker::has_invariants(&schema));
+
+        // Schema with nested invariant in a map value that's a struct
+        let map_field = StructField::nullable(
+            "map_field",
+            MapType::new(
+                DataType::STRING,
+                DataType::struct_type([{
+                    let mut field = StructField::nullable("d", DataType::INTEGER);
+                    field.metadata.insert(
+                        ColumnMetadataKey::Invariants.as_ref().to_string(),
+                        MetadataValue::String("d > 0".to_string()),
+                    );
+                    field
+                }]),
+                true,
+            ),
+        );
+
+        let schema = StructType::new([
+            StructField::nullable("a", DataType::STRING),
+            StructField::nullable("b", DataType::INTEGER),
+            map_field,
+        ]);
+        assert!(InvariantChecker::has_invariants(&schema));
     }
 }

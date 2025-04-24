@@ -37,15 +37,17 @@ fn reader_test(path: &Path) -> datatest_stable::Result<()> {
             );
 
             case.assert_metadata(engine.clone()).await.unwrap();
-            acceptance::data::assert_scan_data(engine.clone(), &case)
+            acceptance::data::assert_scan_metadata(engine.clone(), &case)
                 .await
                 .unwrap();
         });
     Ok(())
 }
 
-datatest_stable::harness!(
-    reader_test,
-    "tests/dat/out/reader_tests/generated/",
-    r"test_case_info\.json"
-);
+datatest_stable::harness! {
+    {
+        test = reader_test,
+        root = "tests/dat/out/reader_tests/generated/",
+        pattern = r"test_case_info\.json"
+    },
+}

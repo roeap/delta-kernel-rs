@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::expressions::column_name;
-use crate::predicates::{DefaultPredicateEvaluator, UnimplementedColumnResolver};
+use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, UnimplementedColumnResolver};
 use std::collections::HashMap;
 
 const TRUE: Option<bool> = Some(true);
@@ -25,14 +25,14 @@ macro_rules! expect_eq {
 #[test]
 fn test_eval_is_null() {
     let col = &column_expr!("x");
-    let expressions = [Expr::is_null(col.clone()), !Expr::is_null(col.clone())];
+    let expressions = [Expr::is_null(col.clone()), Expr::is_not_null(col.clone())];
 
     let do_test = |nullcount: i64, expected: &[Option<bool>]| {
         let resolver = HashMap::from_iter([
             (column_name!("numRecords"), Scalar::from(2i64)),
             (column_name!("nullCount.x"), Scalar::from(nullcount)),
         ]);
-        let filter = DefaultPredicateEvaluator::from(resolver);
+        let filter = DefaultKernelPredicateEvaluator::from(resolver);
         for (expr, expect) in expressions.iter().zip(expected) {
             let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
@@ -75,7 +75,7 @@ fn test_eval_binary_comparisons() {
             (column_name!("minValues.x"), min.clone()),
             (column_name!("maxValues.x"), max.clone()),
         ]);
-        let filter = DefaultPredicateEvaluator::from(resolver);
+        let filter = DefaultKernelPredicateEvaluator::from(resolver);
         for (expr, expect) in expressions.iter().zip(expected.iter()) {
             let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
@@ -107,7 +107,7 @@ fn test_eval_binary_comparisons() {
 }
 
 #[test]
-fn test_eval_variadic() {
+fn test_eval_junction() {
     let test_cases = &[
         (&[] as &[Option<bool>], TRUE, FALSE),
         (&[TRUE], TRUE, TRUE),
@@ -149,7 +149,7 @@ fn test_eval_variadic() {
         (&[NULL, TRUE, FALSE], FALSE, TRUE),
         (&[NULL, FALSE, TRUE], FALSE, TRUE),
     ];
-    let filter = DefaultPredicateEvaluator::from(UnimplementedColumnResolver);
+    let filter = DefaultKernelPredicateEvaluator::from(UnimplementedColumnResolver);
     for (inputs, expect_and, expect_or) in test_cases {
         let inputs: Vec<_> = inputs
             .iter()
@@ -171,7 +171,7 @@ fn test_eval_variadic() {
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(filter.eval_expr(&pred, false), *expect_or, "OR({inputs:?})");
 
-        let expr = !Expr::and_from(inputs.clone());
+        let expr = Expr::not(Expr::and_from(inputs.clone()));
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
             filter.eval_expr(&pred, false),
@@ -179,7 +179,7 @@ fn test_eval_variadic() {
             "NOT AND({inputs:?})"
         );
 
-        let expr = !Expr::or_from(inputs.clone());
+        let expr = Expr::not(Expr::or_from(inputs.clone()));
         let pred = as_data_skipping_predicate(&expr).unwrap();
         expect_eq!(
             filter.eval_expr(&pred, false),
@@ -202,9 +202,9 @@ fn test_eval_distinct() {
 
     let expressions = [
         Expr::distinct(col.clone(), ten.clone()),
-        !Expr::distinct(col.clone(), ten.clone()),
+        Expr::not(Expr::distinct(col.clone(), ten.clone())),
         Expr::distinct(col.clone(), null.clone()),
-        !Expr::distinct(col.clone(), null.clone()),
+        Expr::not(Expr::distinct(col.clone(), null.clone())),
     ];
 
     let do_test = |min: &Scalar, max: &Scalar, nullcount: i64, expected: &[Option<bool>]| {
@@ -214,7 +214,7 @@ fn test_eval_distinct() {
             (column_name!("minValues.x"), min.clone()),
             (column_name!("maxValues.x"), max.clone()),
         ]);
-        let filter = DefaultPredicateEvaluator::from(resolver);
+        let filter = DefaultKernelPredicateEvaluator::from(resolver);
         for (expr, expect) in expressions.iter().zip(expected) {
             let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
@@ -286,7 +286,7 @@ fn test_sql_where() {
                     (column_name!("maxValues.x"), max.clone()),
                 ])
             };
-            let filter = DefaultPredicateEvaluator::from(resolver);
+            let filter = DefaultKernelPredicateEvaluator::from(resolver);
             let pred = as_data_skipping_predicate(expr).unwrap();
             expect_eq!(
                 filter.eval_expr(&pred, false),
