@@ -15,6 +15,14 @@ use crate::expressions::{ArrayData, Expression, JunctionOperator, Scalar};
 use crate::kernel_predicates::KernelPredicateEvaluatorDefaults;
 use crate::schema::PrimitiveType;
 
+/// Evaluates an "IN" expression between a value and a list.
+///
+/// This function handles various combinations of literal values and columns:
+/// - When the left side is NULL, returns NULL for each row abd avoids evaluations.
+/// - When both sides are literals, evaluates once and replicates the result for each row.
+/// - When the right side is a list column, checks if each left value exists in the corresponding list
+///
+/// Returns a boolean array indicating whether each left value is found in the corresponding list.
 pub(super) fn eval_in_list(
     batch: &RecordBatch,
     left: &Expression,
@@ -32,175 +40,8 @@ pub(super) fn eval_in_list(
             let exists = is_in_list(ad, Some(Some(lit.clone()))).iter().next();
             BooleanArray::from(vec![exists.flatten(); batch.num_rows()])
         }
-        (Literal(_) | Column(_), Column(_)) => {
-            let right_arr = evaluate_expression(right, batch, None)?;
-            let list_field = match right_arr.data_type() {
-                ArrowDataType::List(list_field) => list_field,
-                ArrowDataType::LargeList(list_field) => list_field,
-                // TODO: LargeListView - not fully supported by arrow yet
-                _ => {
-                    return Err(Error::invalid_expression(format!(
-                        "Expected right hand side to be list column, got: {:?}",
-                        right_arr.data_type()
-                    )));
-                }
-            };
-
-            let left_arr =
-                evaluate_expression(left, batch, Some(&list_field.data_type().try_into()?))?;
-            // we should at least cast string / large string arrays to the same type, and may as well see if
-            // we can cast other types.
-            let left_arr = if left_arr.data_type() == list_field.data_type() {
-                left_arr
-            } else {
-                cast(left_arr.as_ref(), list_field.data_type()).map_err(Error::generic_err)?
-            };
-
-            macro_rules! left_as {
-                ($t: ty ) => {
-                    left_arr.as_primitive_opt::<$t>().ok_or_else(|| {
-                        Error::invalid_expression(format!(
-                            "Cannot cast {} to {}",
-                            left_arr.data_type(),
-                            <$t>::DATA_TYPE
-                        ))
-                    })
-                };
-            }
-
-            match list_field.data_type() {
-                ArrowDataType::Utf8 | ArrowDataType::LargeUtf8
-                    if right_arr.as_list_opt::<i32>().is_some() =>
-                {
-                    eval_arrow_utf8(&left_arr, right_arr.as_list::<i32>())?
-                }
-                ArrowDataType::Int8 => eval_arrow(left_as!(Int8Type)?, &right_arr)?,
-                ArrowDataType::Int16 => eval_arrow(left_as!(Int16Type)?, &right_arr)?,
-                ArrowDataType::Int32 => eval_arrow(left_as!(Int32Type)?, &right_arr)?,
-                ArrowDataType::Int64 => eval_arrow(left_as!(Int64Type)?, &right_arr)?,
-                ArrowDataType::Float16 => eval_arrow(left_as!(Float16Type)?, &right_arr)?,
-                ArrowDataType::Float32 => eval_arrow(left_as!(Float32Type)?, &right_arr)?,
-                ArrowDataType::Float64 => eval_arrow(left_as!(Float64Type)?, &right_arr)?,
-                ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => {
-                    eval_arrow(left_as!(TimestampMicrosecondType)?, &right_arr)?
-                }
-                ArrowDataType::Date32 => eval_arrow(left_as!(Date32Type)?, &right_arr)?,
-                ArrowDataType::Decimal128(_, _) => {
-                    eval_arrow(left_as!(Decimal128Type)?, &right_arr)?
-                }
-                _ => {
-                    return Err(Error::invalid_expression(format!(
-                        "Cannot compare {} to {}",
-                        left_arr.data_type(),
-                        list_field.data_type()
-                    )))
-                }
-            }
-        }
-        (Column(name), Literal(Scalar::Array(ad))) => {
-            fn scalars_from<'a>(
-                values: impl IntoIterator<Item = Option<impl Into<Scalar>>> + 'a,
-            ) -> impl IntoIterator<Item = Option<Scalar>> + 'a {
-                values.into_iter().map(|v| v.map(Into::into))
-            }
-
-            fn to_scalars<T: ArrowPrimitiveType>(
-                values: &PrimitiveArray<T>,
-                from: fn(T::Native) -> Scalar,
-            ) -> impl IntoIterator<Item = Option<Scalar>> + '_ {
-                values.iter().map(move |v| v.map(from))
-            }
-
-            let column = extract_column(batch, name)?;
-            let data_type = ad
-                .array_type()
-                .element_type()
-                .as_primitive_opt()
-                .ok_or_else(|| {
-                    Error::invalid_expression(format!(
-                        "IN only supports array literals with primitive elements, got: '{:?}'",
-                        ad.array_type().element_type()
-                    ))
-                })?;
-
-            macro_rules! column_as {
-                ($what: ident $(:: < $t: ty >)? ) => {
-                    paste! { column.[<as_ $what _opt>] $(::<$t>)? () }
-                        .ok_or(Error::invalid_expression(format!(
-                            "Cannot cast {} to {}", column.data_type(), data_type
-                        )))
-                };
-            }
-
-            // safety: as_* methods on arrow arrays can panic, but we checked the data type before applying.
-            match (column.data_type(), data_type) {
-                (ArrowDataType::Utf8, PrimitiveType::String) => {
-                    is_in_list(ad, scalars_from(column_as!(string::<i32>)?))
-                }
-                (ArrowDataType::LargeUtf8, PrimitiveType::String) => {
-                    is_in_list(ad, scalars_from(column_as!(string::<i64>)?))
-                }
-                (ArrowDataType::Utf8View, PrimitiveType::String) => {
-                    is_in_list(ad, scalars_from(column_as!(string_view)?))
-                }
-                (ArrowDataType::Boolean, PrimitiveType::Boolean) => {
-                    is_in_list(ad, scalars_from(column_as!(boolean)?))
-                }
-                (ArrowDataType::Binary, PrimitiveType::Binary) => {
-                    is_in_list(ad, scalars_from(column_as!(binary::<i32>)?))
-                }
-                (ArrowDataType::LargeBinary, PrimitiveType::Binary) => {
-                    is_in_list(ad, scalars_from(column_as!(binary::<i64>)?))
-                }
-                (ArrowDataType::BinaryView, PrimitiveType::Binary) => {
-                    is_in_list(ad, scalars_from(column_as!(binary_view)?))
-                }
-                (_, PrimitiveType::Byte) => {
-                    is_in_list(ad, scalars_from(column_as!(primitive::<Int8Type>)?))
-                }
-                (_, PrimitiveType::Short) => {
-                    is_in_list(ad, scalars_from(column_as!(primitive::<Int16Type>)?))
-                }
-                (_, PrimitiveType::Integer) => {
-                    is_in_list(ad, scalars_from(column_as!(primitive::<Int32Type>)?))
-                }
-                (_, PrimitiveType::Long) => {
-                    is_in_list(ad, scalars_from(column_as!(primitive::<Int64Type>)?))
-                }
-                (_, PrimitiveType::Float) => {
-                    is_in_list(ad, scalars_from(column_as!(primitive::<Float32Type>)?))
-                }
-                (_, PrimitiveType::Double) => {
-                    is_in_list(ad, scalars_from(column_as!(primitive::<Float64Type>)?))
-                }
-                (_, PrimitiveType::Date) => is_in_list(
-                    ad,
-                    to_scalars(column_as!(primitive::<Date32Type>)?, Scalar::Date),
-                ),
-                (
-                    ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)),
-                    PrimitiveType::Timestamp,
-                ) => {
-                    let column = column_as!(primitive::<TimestampMicrosecondType>)?;
-                    is_in_list(ad, to_scalars(column, Scalar::Timestamp))
-                }
-                (
-                    ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
-                    PrimitiveType::TimestampNtz,
-                ) => is_in_list(
-                    ad,
-                    to_scalars(
-                        column_as!(primitive::<TimestampMicrosecondType>)?,
-                        Scalar::TimestampNtz,
-                    ),
-                ),
-                (l, r) => {
-                    return Err(Error::invalid_expression(format!(
-                        "Cannot check if value of type '{l}' is in array with value type '{r}'"
-                    )))
-                }
-            }
-        }
+        (Literal(_) | Column(_), Column(_)) => lit_or_col_in_col(batch, left, right)?,
+        (Column(name), Literal(Scalar::Array(ad))) => col_in_lit(batch, name, ad)?,
         (l, r) => {
             return Err(Error::invalid_expression(format!(
                 "Invalid right value for (NOT) IN comparison, left is: {l} right is: {r}"
@@ -208,6 +49,170 @@ pub(super) fn eval_in_list(
         }
     };
     Ok(Arc::new(result))
+}
+
+/// Evaluates an "IN" expression between a column and a list.
+fn col_in_lit(
+    batch: &RecordBatch,
+    name: &crate::schema::ColumnName,
+    ad: &ArrayData,
+) -> Result<BooleanArray, Error> {
+    fn scalars_from<'a>(
+        values: impl IntoIterator<Item = Option<impl Into<Scalar>>> + 'a,
+    ) -> impl IntoIterator<Item = Option<Scalar>> + 'a {
+        values.into_iter().map(|v| v.map(Into::into))
+    }
+    fn to_scalars<T: ArrowPrimitiveType>(
+        values: &PrimitiveArray<T>,
+        from: fn(T::Native) -> Scalar,
+    ) -> impl IntoIterator<Item = Option<Scalar>> + '_ {
+        values.iter().map(move |v| v.map(from))
+    }
+    let column = extract_column(batch, name)?;
+    let data_type = ad
+        .array_type()
+        .element_type()
+        .as_primitive_opt()
+        .ok_or_else(|| {
+            Error::invalid_expression(format!(
+                "IN only supports array literals with primitive elements, got: '{:?}'",
+                ad.array_type().element_type()
+            ))
+        })?;
+    macro_rules! column_as {
+        ($what: ident $(:: < $t: ty >)? ) => {
+            paste! { column.[<as_ $what _opt>] $(::<$t>)? () }
+                .ok_or(Error::invalid_expression(format!(
+                    "Cannot cast {} to {}", column.data_type(), data_type
+                )))
+        };
+    }
+    Ok(match (column.data_type(), data_type) {
+        (ArrowDataType::Utf8, PrimitiveType::String) => {
+            is_in_list(ad, scalars_from(column_as!(string::<i32>)?))
+        }
+        (ArrowDataType::LargeUtf8, PrimitiveType::String) => {
+            is_in_list(ad, scalars_from(column_as!(string::<i64>)?))
+        }
+        (ArrowDataType::Utf8View, PrimitiveType::String) => {
+            is_in_list(ad, scalars_from(column_as!(string_view)?))
+        }
+        (ArrowDataType::Boolean, PrimitiveType::Boolean) => {
+            is_in_list(ad, scalars_from(column_as!(boolean)?))
+        }
+        (ArrowDataType::Binary, PrimitiveType::Binary) => {
+            is_in_list(ad, scalars_from(column_as!(binary::<i32>)?))
+        }
+        (ArrowDataType::LargeBinary, PrimitiveType::Binary) => {
+            is_in_list(ad, scalars_from(column_as!(binary::<i64>)?))
+        }
+        (ArrowDataType::BinaryView, PrimitiveType::Binary) => {
+            is_in_list(ad, scalars_from(column_as!(binary_view)?))
+        }
+        (_, PrimitiveType::Byte) => {
+            is_in_list(ad, scalars_from(column_as!(primitive::<Int8Type>)?))
+        }
+        (_, PrimitiveType::Short) => {
+            is_in_list(ad, scalars_from(column_as!(primitive::<Int16Type>)?))
+        }
+        (_, PrimitiveType::Integer) => {
+            is_in_list(ad, scalars_from(column_as!(primitive::<Int32Type>)?))
+        }
+        (_, PrimitiveType::Long) => {
+            is_in_list(ad, scalars_from(column_as!(primitive::<Int64Type>)?))
+        }
+        (_, PrimitiveType::Float) => {
+            is_in_list(ad, scalars_from(column_as!(primitive::<Float32Type>)?))
+        }
+        (_, PrimitiveType::Double) => {
+            is_in_list(ad, scalars_from(column_as!(primitive::<Float64Type>)?))
+        }
+        (_, PrimitiveType::Date) => is_in_list(
+            ad,
+            to_scalars(column_as!(primitive::<Date32Type>)?, Scalar::Date),
+        ),
+        (ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)), PrimitiveType::Timestamp) => {
+            let column = column_as!(primitive::<TimestampMicrosecondType>)?;
+            is_in_list(ad, to_scalars(column, Scalar::Timestamp))
+        }
+        (ArrowDataType::Timestamp(TimeUnit::Microsecond, None), PrimitiveType::TimestampNtz) => {
+            is_in_list(
+                ad,
+                to_scalars(
+                    column_as!(primitive::<TimestampMicrosecondType>)?,
+                    Scalar::TimestampNtz,
+                ),
+            )
+        }
+        (l, r) => {
+            return Err(Error::invalid_expression(format!(
+                "Cannot check if value of type '{l}' is in array with value type '{r}'"
+            )))
+        }
+    })
+}
+
+/// Evaluates an "IN" expression between a literal value or column and a list column.
+fn lit_or_col_in_col(
+    batch: &RecordBatch,
+    left: &Expression,
+    right: &Expression,
+) -> Result<BooleanArray, Error> {
+    let right_arr = evaluate_expression(right, batch, None)?;
+    let list_field = match right_arr.data_type() {
+        ArrowDataType::List(list_field) => list_field,
+        ArrowDataType::LargeList(list_field) => list_field,
+        // TODO: LargeListView - not fully supported by arrow yet
+        _ => {
+            return Err(Error::invalid_expression(format!(
+                "Expected right hand side to be list column, got: {:?}",
+                right_arr.data_type()
+            )));
+        }
+    };
+    let left_arr = evaluate_expression(left, batch, Some(&list_field.data_type().try_into()?))?;
+    let left_arr = if left_arr.data_type() == list_field.data_type() {
+        left_arr
+    } else {
+        cast(left_arr.as_ref(), list_field.data_type()).map_err(Error::generic_err)?
+    };
+    macro_rules! left_as {
+        ($t: ty ) => {
+            left_arr.as_primitive_opt::<$t>().ok_or_else(|| {
+                Error::invalid_expression(format!(
+                    "Cannot cast {} to {}",
+                    left_arr.data_type(),
+                    <$t>::DATA_TYPE
+                ))
+            })
+        };
+    }
+    Ok(match list_field.data_type() {
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8
+            if right_arr.as_list_opt::<i32>().is_some() =>
+        {
+            eval_arrow_utf8(&left_arr, right_arr.as_list::<i32>())?
+        }
+        ArrowDataType::Int8 => eval_arrow(left_as!(Int8Type)?, &right_arr)?,
+        ArrowDataType::Int16 => eval_arrow(left_as!(Int16Type)?, &right_arr)?,
+        ArrowDataType::Int32 => eval_arrow(left_as!(Int32Type)?, &right_arr)?,
+        ArrowDataType::Int64 => eval_arrow(left_as!(Int64Type)?, &right_arr)?,
+        ArrowDataType::Float16 => eval_arrow(left_as!(Float16Type)?, &right_arr)?,
+        ArrowDataType::Float32 => eval_arrow(left_as!(Float32Type)?, &right_arr)?,
+        ArrowDataType::Float64 => eval_arrow(left_as!(Float64Type)?, &right_arr)?,
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => {
+            eval_arrow(left_as!(TimestampMicrosecondType)?, &right_arr)?
+        }
+        ArrowDataType::Date32 => eval_arrow(left_as!(Date32Type)?, &right_arr)?,
+        ArrowDataType::Decimal128(_, _) => eval_arrow(left_as!(Decimal128Type)?, &right_arr)?,
+        _ => {
+            return Err(Error::invalid_expression(format!(
+                "Cannot compare {} to {}",
+                left_arr.data_type(),
+                list_field.data_type()
+            )))
+        }
+    })
 }
 
 fn is_in_list(ad: &ArrayData, values: impl IntoIterator<Item = Option<Scalar>>) -> BooleanArray {
