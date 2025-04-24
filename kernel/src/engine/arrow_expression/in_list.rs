@@ -60,7 +60,7 @@ pub(super) fn eval_in_list(
                 ($t: ty ) => {
                     left_arr
                         .as_primitive_opt::<$t>()
-                        .ok_or(Error::invalid_expression(format!(
+                        .ok_or_else(|| Error::invalid_expression(format!(
                             "Cannot cast {} to {}",
                             left_arr.data_type(),
                             <$t>::DATA_TYPE
@@ -101,7 +101,7 @@ pub(super) fn eval_in_list(
             fn scalars_from<'a>(
                 values: impl IntoIterator<Item = Option<impl Into<Scalar>>> + 'a,
             ) -> impl IntoIterator<Item = Option<Scalar>> + 'a {
-                values.into_iter().map(|v| v.map(|v| v.into()))
+                values.into_iter().map(|v| v.map(Into::into))
             }
 
             fn to_scalars<T: ArrowPrimitiveType>(
@@ -180,13 +180,10 @@ pub(super) fn eval_in_list(
                 (
                     ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)),
                     PrimitiveType::Timestamp,
-                ) => is_in_list(
-                    ad,
-                    to_scalars(
-                        column_as!(primitive::<TimestampMicrosecondType>)?,
-                        Scalar::Timestamp,
-                    ),
-                ),
+                ) => {
+                    let column = column_as!(primitive::<TimestampMicrosecondType>)?;
+                    is_in_list(ad, to_scalars(column, Scalar::Timestamp))
+                }
                 (
                     ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
                     PrimitiveType::TimestampNtz,
