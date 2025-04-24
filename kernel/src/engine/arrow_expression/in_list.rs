@@ -58,13 +58,13 @@ pub(super) fn eval_in_list(
 
             macro_rules! left_as {
                 ($t: ty ) => {
-                    left_arr
-                        .as_primitive_opt::<$t>()
-                        .ok_or_else(|| Error::invalid_expression(format!(
+                    left_arr.as_primitive_opt::<$t>().ok_or_else(|| {
+                        Error::invalid_expression(format!(
                             "Cannot cast {} to {}",
                             left_arr.data_type(),
                             <$t>::DATA_TYPE
-                        )))
+                        ))
+                    })
                 };
             }
 
