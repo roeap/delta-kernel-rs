@@ -181,8 +181,8 @@ impl Metadata {
 
     #[internal_api]
     #[allow(dead_code)]
-    pub(crate) fn name(&self) -> Option<&String> {
-        self.name.as_ref()
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     #[internal_api]
