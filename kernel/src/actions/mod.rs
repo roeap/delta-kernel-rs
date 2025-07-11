@@ -187,8 +187,8 @@ impl Metadata {
 
     #[internal_api]
     #[allow(dead_code)]
-    pub(crate) fn description(&self) -> Option<&String> {
-        self.description.as_ref()
+    pub(crate) fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     #[internal_api]
