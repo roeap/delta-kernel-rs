@@ -173,6 +173,7 @@ pub(crate) struct Metadata {
 }
 
 impl Metadata {
+    // TODO(#1068/1069): make these just pub directly or make better internal_api macro for fields
     #[internal_api]
     #[allow(dead_code)]
     pub(crate) fn id(&self) -> &str {
