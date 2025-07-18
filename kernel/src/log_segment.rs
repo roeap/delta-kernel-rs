@@ -57,6 +57,7 @@ pub(crate) struct LogSegment {
 }
 
 impl LogSegment {
+    #[internal_api]
     pub(crate) fn try_new(
         listed_files: ListedLogFiles,
         log_root: Url,
@@ -504,6 +505,7 @@ fn list_log_files(
 /// of the same checkpoint. Checkpoint parts share the same version. The `latest_crc_file` includes
 /// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
 #[derive(Debug)]
+#[internal_api]
 pub(crate) struct ListedLogFiles {
     pub ascending_commit_files: Vec<ParsedLogPath>,
     pub ascending_compaction_files: Vec<ParsedLogPath>,
@@ -512,7 +514,8 @@ pub(crate) struct ListedLogFiles {
 }
 
 impl ListedLogFiles {
-    fn new(
+    #[internal_api]
+    pub(crate) fn new(
         ascending_commit_files: Vec<ParsedLogPath>,
         ascending_compaction_files: Vec<ParsedLogPath>,
         checkpoint_parts: Vec<ParsedLogPath>,
