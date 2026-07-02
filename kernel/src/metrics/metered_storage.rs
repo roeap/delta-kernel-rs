@@ -5,13 +5,13 @@
 //! [`MeteredDeltaEngine`]: crate::metrics::MeteredDeltaEngine
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::Bytes;
 use url::Url;
 
 use crate::metrics::events::{StorageCopyCompleted, StorageListCompleted, StorageReadCompleted};
 use crate::metrics::{emit_storage_span, MetricsIterator};
+use crate::time::Instant;
 use crate::{DeltaResult, FileMeta, FileSlice, StorageHandler};
 
 /// Decorator over an engine-provided `Arc<dyn StorageHandler>` that emits the kernel's
