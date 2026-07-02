@@ -1,0 +1,5 @@
+# getrandom 0.3 requires an explicit backend on wasm32-unknown-unknown. This routes it through
+# the JS `wasm_js` backend (paired with the `getrandom`/`uuid` wasm-target features in
+# kernel/Cargo.toml) so `rand` and `uuid` v4 work in the browser. Applies only to wasm builds.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

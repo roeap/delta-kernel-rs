@@ -61,6 +61,29 @@ delta_kernel = "0.25.0"
 delta_kernel_default_engine = { version = "0.25.0", features = ["rustls"] }
 ```
 
+### WebAssembly (`wasm32-unknown-unknown`)
+The core `delta_kernel` crate compiles to `wasm32-unknown-unknown` for use from a WASM host
+that supplies its own `Engine` implementation (all I/O is delegated to the engine, so kernel
+itself has no I/O). Build it with no default features so the Arrow/Parquet/`object_store`
+dependencies stay out:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo build -p delta_kernel --no-default-features --lib --target wasm32-unknown-unknown
+```
+
+The repo's `.cargo/config.toml` passes `--cfg getrandom_backend="wasm_js"` for wasm builds,
+which (together with the crate's wasm-target `getrandom`/`uuid`/`js-sys` dependencies) lets
+`rand` and `uuid` v4 generation work in the browser. Time (`Instant`/`SystemTime`, used only for
+metrics and commit timestamps) is provided on wasm by a small `js-sys`-backed shim in
+`kernel/src/time.rs`.
+
+Note: local filesystem paths are unavailable on wasm; pass fully-qualified URLs (e.g.
+`memory://`, `s3://`, `https://`) to snapshot/table-builder APIs. Enabling the arrow/parquet
+features on wasm is not supported, and — as a side effect of the wasm-target dependencies — the
+native `--all-features` build no longer resolves cleanly on this fork (a wasm build never enables
+those features, so the two configurations do not collide).
+
 ### Feature flags
 `delta_kernel_default_engine` exposes the following feature flags:
 

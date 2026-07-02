@@ -614,7 +614,7 @@ impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<'_, D> {
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        let start = std::time::Instant::now();
+        let start = crate::time::Instant::now();
 
         let is_log_batch = self.deduplicator.is_log_batch();
         let expected_getters = if is_log_batch { 11 } else { 7 };

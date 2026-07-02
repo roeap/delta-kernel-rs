@@ -1,7 +1,6 @@
 //! Metrics reporter trait and tracing-layer integration.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -15,6 +14,7 @@ use super::events::{
     ScanMetadataCompleted, SetTransactionLoadSuccess, SnapshotBuildSuccess,
     TransactionCommitSuccess, STORAGE_SPAN,
 };
+use crate::time::Instant;
 
 // ====================================================================
 // MetricsReporter trait + LoggingMetricsReporter

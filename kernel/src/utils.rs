@@ -2,11 +2,12 @@
 use std::borrow::Cow;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use delta_kernel_derive::internal_api;
 use url::Url;
 
+use crate::time::SystemTime;
 use crate::{DeltaResult, Error};
 
 /// convenient way to return an error if a condition isn't true
@@ -63,33 +64,49 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
     let uri = uri.as_ref();
     let uri_type = resolve_uri_type(uri)?;
     let url = match uri_type {
-        UriType::LocalPath(path) => {
-            if !path.exists() {
-                // When we support writes, create a directory if we can
-                return Err(Error::InvalidTableLocation(format!(
-                    "Path does not exist: {path:?}"
-                )));
-            }
-            if !path.is_dir() {
-                return Err(Error::InvalidTableLocation(format!(
-                    "{path:?} is not a directory"
-                )));
-            }
-            let path = std::fs::canonicalize(path).map_err(|err| {
-                let msg = format!("Invalid table location: {uri} Error: {err:?}");
-                Error::InvalidTableLocation(msg)
-            })?;
-            Url::from_directory_path(path.clone()).map_err(|_| {
-                let msg = format!(
-                    "Could not construct a URL from canonicalized path: {path:?}.\n\
-                     Something must be very wrong with the table path."
-                );
-                Error::InvalidTableLocation(msg)
-            })?
-        }
+        UriType::LocalPath(path) => local_path_to_url(&path, uri)?,
         UriType::Url(url) => url,
     };
     Ok(url)
+}
+
+/// Canonicalize a local filesystem path into a `file://` directory URL.
+///
+/// Local-path resolution requires filesystem access (`std::fs`) and the `url` crate's
+/// path helpers, neither of which is available on `wasm32-unknown-unknown`; on wasm a
+/// caller must pass a fully-qualified URL (e.g. `memory://`, `s3://`, `https://`) instead.
+#[cfg(not(target_arch = "wasm32"))]
+fn local_path_to_url(path: &std::path::Path, uri: &str) -> DeltaResult<Url> {
+    if !path.exists() {
+        // When we support writes, create a directory if we can
+        return Err(Error::InvalidTableLocation(format!(
+            "Path does not exist: {path:?}"
+        )));
+    }
+    if !path.is_dir() {
+        return Err(Error::InvalidTableLocation(format!(
+            "{path:?} is not a directory"
+        )));
+    }
+    let path = std::fs::canonicalize(path).map_err(|err| {
+        let msg = format!("Invalid table location: {uri} Error: {err:?}");
+        Error::InvalidTableLocation(msg)
+    })?;
+    Url::from_directory_path(path.clone()).map_err(|_| {
+        let msg = format!(
+            "Could not construct a URL from canonicalized path: {path:?}.\n\
+             Something must be very wrong with the table path."
+        );
+        Error::InvalidTableLocation(msg)
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_path_to_url(_path: &std::path::Path, uri: &str) -> DeltaResult<Url> {
+    Err(Error::InvalidTableLocation(format!(
+        "Local filesystem paths are not supported on wasm; pass a fully-qualified URL \
+         instead of {uri:?}"
+    )))
 }
 
 #[allow(unused)]
@@ -114,10 +131,15 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
     if let Ok(url) = Url::parse(&table_uri) {
         let scheme = url.scheme().to_string();
         if url.scheme() == "file" {
-            Ok(UriType::LocalPath(
-                url.to_file_path()
-                    .map_err(|_| Error::invalid_table_location(table_uri))?,
-            ))
+            // `Url::to_file_path` requires the `url` crate's std path support, absent on wasm.
+            // A `file://` URL denotes a local path, which local_path_to_url rejects on wasm.
+            #[cfg(not(target_arch = "wasm32"))]
+            let path = url
+                .to_file_path()
+                .map_err(|_| Error::invalid_table_location(&table_uri))?;
+            #[cfg(target_arch = "wasm32")]
+            let path = PathBuf::from(url.path());
+            Ok(UriType::LocalPath(path))
         } else if scheme.len() == 1 {
             // NOTE this check is required to support absolute windows paths which may properly
             // parse as url we assume here that a single character scheme is a windows drive letter
@@ -133,7 +155,7 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
 /// Returns the current time as a Duration since Unix epoch.
 pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
     SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|e| Error::generic(format!("System time before Unix epoch: {e}")))
 }
 

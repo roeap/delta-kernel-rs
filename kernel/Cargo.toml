@@ -58,14 +58,38 @@ tracing-subscriber = "0.3"
 url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
-
-# optional deps
-# `reqwest` is only needed for the gated `Error::Reqwest` variant; the actual HTTP client
-# lives in the `delta_kernel_default_engine` crate now.
+# `reqwest` is only needed for the gated `Error::Reqwest` variant; the actual HTTP
+# client lives in the `delta_kernel_default_engine` crate now. Kept as a plain
+# (non-target) optional dep so it resolves on every target.
 reqwest = { version = "0.13", default-features = false, optional = true }
-# both arrow versions below are optional and require object_store
+
+# wasm-only deps: `js-sys` backs the wasm `Instant`/`SystemTime` shims in `src/time.rs`
+# (std's clocks panic on wasm32-unknown-unknown); `getrandom`'s `wasm_js` feature and uuid's `js`
+# feature back `rand` and `uuid` v4 generation. The consumer must also pass
+# `--cfg getrandom_backend="wasm_js"` at build time -- see the wasm build note in the README.
+#
+# NOTE: any wasm-target dep here perturbs Cargo resolver-v3 feature unification and breaks the
+# NATIVE `--all-features` build (parquet ends up linking a `tokio`-less object_store). That is
+# acceptable for this wasm-focused fork: a wasm build uses `--no-default-features` and never
+# enables the arrow/parquet/object_store features, so the two never collide in one resolution.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+uuid = { version = "1.18.0", features = ["js", "v4", "fast-rng"] }
+
+# both arrow versions below are optional and require object_store.
+# The cloud store features (`aws`/`azure`/`gcp`/`http`) pull a native TLS/HTTP
+# stack (`ring`, `hyper`) that does not build for wasm32-unknown-unknown, and the
+# kernel core references no cloud store types itself (they exist only for
+# downstream consumers). So enable cloud features off-wasm only; on wasm the host
+# supplies its own (fetch-backed) object store.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 object_store_12 = { package = "object_store", version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
 object_store_13 = { package = "object_store", version = "0.13.2", optional = true, features = ["aws", "azure", "gcp", "http"] }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+object_store_12 = { package = "object_store", version = "0.12.3", optional = true }
+object_store_13 = { package = "object_store", version = "0.13.2", optional = true }
 
 # arrow 57
 [dependencies.arrow_57]

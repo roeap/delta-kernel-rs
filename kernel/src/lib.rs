@@ -75,10 +75,10 @@ extern crate self as delta_kernel;
 
 use std::any::Any;
 use std::cmp::Ordering;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::DirEntry;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use bytes::Bytes;
 use url::Url;
@@ -130,6 +130,8 @@ pub(crate) mod clustering;
 mod arrow_compat;
 #[cfg(any(feature = "arrow-57", feature = "arrow-58"))]
 pub use arrow_compat::*;
+
+pub(crate) mod time;
 
 #[cfg(feature = "internal-api")]
 pub mod column_trie;
@@ -237,6 +239,9 @@ impl PartialOrd for FileMeta {
     }
 }
 
+// `DirEntry` is a native-filesystem construct (`std::fs::read_dir`); local-directory
+// listing is unavailable on wasm, so this conversion is native-only.
+#[cfg(not(target_arch = "wasm32"))]
 impl TryFrom<DirEntry> for FileMeta {
     type Error = Error;
 
@@ -244,7 +249,7 @@ impl TryFrom<DirEntry> for FileMeta {
         let metadata = ent.metadata()?;
         let last_modified = metadata
             .modified()?
-            .duration_since(SystemTime::UNIX_EPOCH)
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map_err(|_| Error::generic("Failed to convert file timestamp to milliseconds"))?;
         let location = Url::from_file_path(ent.path())
             .map_err(|_| Error::generic(format!("Invalid path: {:?}", ent.path())))?;

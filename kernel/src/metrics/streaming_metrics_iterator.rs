@@ -8,11 +8,11 @@
 //! [`MeteredStorageHandler`]: crate::metrics::MeteredStorageHandler
 
 use std::marker::PhantomData;
-use std::time::Instant;
 
 use bytes::Bytes;
 
 use crate::metrics::events::STORAGE_SPAN;
+use crate::time::Instant;
 use crate::{DeltaResult, FileMeta};
 
 /// Counts items observed and emits a `"storage"` span on drop. The type parameter
