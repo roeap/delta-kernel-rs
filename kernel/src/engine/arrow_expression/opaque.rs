@@ -169,7 +169,20 @@ impl OpaqueExpressionOp for ArrowOpaqueExpressionOpAdaptor {
 /// from `&dyn OpaquePredicateOp` to the concrete `ArrowOpaquePredicateOpAdaptor` type that
 /// implements both traits, and extract its inner `dyn ArrowOpaquePredicateOp`.
 #[derive(Debug)]
-pub(crate) struct ArrowOpaquePredicateOpAdaptor(Box<dyn ArrowOpaquePredicateOp>);
+pub struct ArrowOpaquePredicateOpAdaptor(Box<dyn ArrowOpaquePredicateOp>);
+
+impl ArrowOpaquePredicateOpAdaptor {
+    /// Returns the wrapped [`ArrowOpaquePredicateOp`].
+    ///
+    /// Engines that construct opaque predicates via [`ArrowOpaquePredicate::arrow_opaque`] can
+    /// recover their concrete op from a `Predicate::Opaque` by first downcasting the stored
+    /// `dyn OpaquePredicateOp` to this adaptor, then downcasting `op().any_ref()` to the concrete
+    /// [`ArrowOpaquePredicateOp`] type. This is the only supported recovery path, since the
+    /// adaptor is what actually implements [`OpaquePredicateOp`].
+    pub fn op(&self) -> &dyn ArrowOpaquePredicateOp {
+        &*self.0
+    }
+}
 
 impl std::ops::Deref for ArrowOpaquePredicateOpAdaptor {
     type Target = dyn ArrowOpaquePredicateOp;
