@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+
+use crate::time::Instant;
 
 use tracing::{debug, error};
 
