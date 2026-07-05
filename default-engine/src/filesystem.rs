@@ -19,9 +19,7 @@ pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
 }
 
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
-    // wasm spike (delta-rs): delta-rs's DataFusion engine constructs the storage handler
-    // directly (bypassing MeteredStorageHandler), the way this was public pre-relocation.
-    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             inner: store,
             task_executor,
