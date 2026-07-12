@@ -11,7 +11,7 @@ use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 pub use self::column_names::__require_valid_simple_column_segment;
 pub use self::column_names::{
     col, column_expr, column_expr_ref, column_name, column_pred, joined_column_expr,
-    joined_column_name, ColumnName,
+    joined_column_name, ColumnName, IntoColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use crate::kernel_predicates::{
@@ -47,6 +47,27 @@ pub type PredicateRef = std::sync::Arc<Predicate>;
 /// ```
 pub fn lit(value: impl Into<Scalar>) -> Expression {
     Expression::literal(value)
+}
+
+/// Build an [`Expression::Column`] reference from anything that converts into a
+/// [`ColumnName`].
+///
+/// Concise alternative to `Expression::column([name])` for plan builders. Accepts the same
+/// shapes as [`IntoColumnName`]: a bare `&str` (`col("path")`), a nested path
+/// (`col(["add", "path"])`), or a prebuilt [`ColumnName`]. The returned [`Expression`] composes
+/// directly with the `is_not_null` / `eq` / `le` / ... predicate constructors and auto-wraps to
+/// `Arc<Expression>` at IR boundaries via the blanket `From<T> for Arc<T>`.
+///
+/// Unlike the [`col!`](crate::expressions::col!) macro's single-string form, each segment is
+/// taken verbatim: `col("a.b")` is ONE segment whose name contains a dot, whereas `col!("a.b")`
+/// splits into two segments.
+///
+/// ```
+/// use delta_kernel::expressions::col;
+/// let _p = col(["add", "path"]).is_not_null();
+/// ```
+pub fn col<N: IntoColumnName>(name: N) -> Expression {
+    Expression::Column(name.into_column_name())
 }
 
 /// A [`StructPatchBuilder`](crate::struct_patch::StructPatchBuilder) whose emitted items are
@@ -271,6 +292,22 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
+/// A conditional expression: `IF(condition, then_expr, else_expr)`.
+///
+/// Equivalent to SQL's `CASE WHEN condition THEN then_expr ELSE else_expr END` for a single
+/// branch. NULL conditions are treated as false (SQL standard), so a NULL condition selects
+/// `else_expr`. Use [`Expression::case_when`] for multi-branch CASE expressions, which
+/// desugars into nested `If` expressions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IfExpression {
+    /// The boolean condition.
+    pub condition: Box<Predicate>,
+    /// The expression evaluated when `condition` is true.
+    pub then_expr: Box<Expression>,
+    /// The expression evaluated when `condition` is false or NULL.
+    pub else_expr: Box<Expression>,
+}
+
 /// An expression that parses a JSON string into a struct with the given schema.
 /// This is the inverse of `ToJson` - it converts a JSON-encoded string column into a
 /// struct column.
@@ -396,6 +433,8 @@ pub enum Expression {
     Binary(BinaryExpression),
     /// An expression that takes a variable number of expressions as input.
     Variadic(VariadicExpression),
+    /// A conditional expression: `IF(condition, then_expr, else_expr)`.
+    If(IfExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
     #[serde(serialize_with = "fail_serialize_opaque_expression")]
@@ -525,6 +564,20 @@ impl VariadicExpression {
     ) -> Self {
         let exprs = exprs.into_iter().map(Into::into).collect();
         Self { op, exprs }
+    }
+}
+
+impl IfExpression {
+    pub(crate) fn new(
+        condition: impl Into<Predicate>,
+        then_expr: impl Into<Expression>,
+        else_expr: impl Into<Expression>,
+    ) -> Self {
+        Self {
+            condition: Box::new(condition.into()),
+            then_expr: Box::new(then_expr.into()),
+            else_expr: Box::new(else_expr.into()),
+        }
     }
 }
 
@@ -721,6 +774,38 @@ impl Expression {
         Self::variadic(VariadicExpressionOp::Array, exprs)
     }
 
+    /// Creates a new conditional expression `IF(condition, then_expr, else_expr)`.
+    ///
+    /// Equivalent to SQL's `CASE WHEN condition THEN then_expr ELSE else_expr END`. NULL
+    /// conditions are treated as false (SQL standard), so a NULL condition selects `else_expr`.
+    pub fn if_then_else(
+        condition: impl Into<Predicate>,
+        then_expr: impl Into<Expression>,
+        else_expr: impl Into<Expression>,
+    ) -> Self {
+        Self::If(IfExpression::new(condition, then_expr, else_expr))
+    }
+
+    /// Creates a SQL CASE expression that desugars to nested `If` expressions.
+    ///
+    /// Branches are evaluated in order; the first branch whose predicate is true selects its
+    /// expression. If no branch matches, `else_expr` is returned. With zero branches, returns
+    /// `else_expr` directly.
+    ///
+    /// `CASE WHEN p1 THEN e1 WHEN p2 THEN e2 ELSE e_else END`
+    /// becomes `If(p1, e1, If(p2, e2, e_else))`.
+    pub fn case_when(
+        branches: impl IntoIterator<Item = (Predicate, Expression)>,
+        else_expr: impl Into<Expression>,
+    ) -> Self {
+        let branches: Vec<_> = branches.into_iter().collect();
+        let mut result = else_expr.into();
+        for (cond, then_expr) in branches.into_iter().rev() {
+            result = Self::if_then_else(cond, then_expr, result);
+        }
+        result
+    }
+
     /// Creates a new opaque expression
     pub fn opaque(
         op: impl OpaqueExpressionOp,
@@ -746,6 +831,16 @@ impl Expression {
     /// and to null for every other type. See [`MapToStructExpression`] for the full contract.
     pub fn map_to_struct(map_expr: impl Into<Expression>) -> Self {
         Self::MapToStruct(MapToStructExpression::new(map_expr))
+    }
+
+    /// `COALESCE(self, lit(default))` -- substitute NULL with a default scalar.
+    pub fn or_lit<S: Into<Scalar>>(self, default: S) -> Expression {
+        Expression::coalesce([self, Expression::literal(default)])
+    }
+
+    /// `COALESCE(self, other)` -- substitute NULL with another expression.
+    pub fn or_else(self, other: impl Into<Expression>) -> Expression {
+        Expression::coalesce([self, other.into()])
     }
 }
 
@@ -1013,6 +1108,11 @@ impl Display for Expression {
             Variadic(VariadicExpression { op, exprs }) => {
                 write!(f, "{op}({})", format_child_list(exprs))
             }
+            If(IfExpression {
+                condition,
+                then_expr,
+                else_expr,
+            }) => write!(f, "IF({condition}, {then_expr}, {else_expr})"),
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
             }
@@ -1159,6 +1259,14 @@ mod tests {
             (
                 Expr::array([column_expr!("x"), column_expr!("y"), Expr::literal(0)]),
                 "ARRAY(Column(x), Column(y), 0)",
+            ),
+            (
+                Expr::if_then_else(
+                    column_expr!("x").is_null(),
+                    Expr::literal(0),
+                    column_expr!("x"),
+                ),
+                "IF(Column(x) IS NULL, 0, Column(x))",
             ),
         ];
 
@@ -1374,6 +1482,62 @@ mod tests {
         ]))]
         fn test_array_expression_roundtrip(#[case] expr: Expression) {
             assert_roundtrip(&expr);
+        }
+
+        #[rstest::rstest]
+        #[case::simple(Expression::if_then_else(
+            column_expr!("flag").is_null(),
+            Expression::literal(0i64),
+            column_expr!("value"),
+        ))]
+        // IF(a IS NULL, 0, IF(a > 100, 100, a)) -- a typical clamp pattern.
+        #[case::nested(Expression::if_then_else(
+            column_expr!("a").is_null(),
+            Expression::literal(0i64),
+            Expression::if_then_else(
+                column_expr!("a").gt(Expression::literal(100i64)),
+                Expression::literal(100i64),
+                column_expr!("a"),
+            ),
+        ))]
+        fn test_if_expression_roundtrip(#[case] expr: Expression) {
+            assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_case_when_desugars_to_nested_if() {
+            // CASE WHEN p1 THEN e1 WHEN p2 THEN e2 ELSE e_else END
+            // becomes If(p1, e1, If(p2, e2, e_else))
+            let p1 = column_expr!("a").lt(Expression::literal(0i64));
+            let p2 = column_expr!("a").eq(Expression::literal(0i64));
+            let case = Expression::case_when(
+                vec![
+                    (p1.clone(), Expression::literal("negative")),
+                    (p2.clone(), Expression::literal("zero")),
+                ],
+                Expression::literal("positive"),
+            );
+
+            let expected = Expression::if_then_else(
+                p1,
+                Expression::literal("negative"),
+                Expression::if_then_else(
+                    p2,
+                    Expression::literal("zero"),
+                    Expression::literal("positive"),
+                ),
+            );
+            assert_eq!(case, expected);
+        }
+
+        #[test]
+        fn test_case_when_with_zero_branches_returns_else() {
+            // CASE ELSE e_else END (no WHEN branches) collapses to e_else directly.
+            let case = Expression::case_when(
+                Vec::<(Predicate, Expression)>::new(),
+                Expression::literal(42i64),
+            );
+            assert_eq!(case, Expression::literal(42i64));
         }
 
         #[test]

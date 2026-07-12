@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef,
-    ExpressionStructPatch, JunctionPredicate, MapToStructExpression, OpaqueExpression,
-    OpaquePredicate, ParseJsonExpression, Predicate, Scalar, UnaryExpression, UnaryPredicate,
-    VariadicExpression,
+    ExpressionStructPatch, IfExpression, JunctionPredicate, MapToStructExpression,
+    OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, UnaryExpression,
+    UnaryPredicate, VariadicExpression,
 };
 use crate::transforms::{
-    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else, transform_output_type,
-    Carrier,
+    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else,
+    map_owned_triple_or_else, transform_output_type, Carrier,
 };
 use crate::{DeltaResult, Error};
 
@@ -190,6 +190,12 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_expr_variadic(expr)
     }
 
+    /// Called for each conditional `If` expression encountered during the traversal. The provided
+    /// implementation just forwards to [`Self::recurse_into_expr_if`].
+    fn transform_expr_if(&mut self, expr: &'a IfExpression) -> Self::Output<IfExpression> {
+        self.recurse_into_expr_if(expr)
+    }
+
     /// Called for each junction predicate encountered during the traversal. The provided
     /// implementation just forwards to [`Self::recurse_into_pred_junction`].
     fn transform_pred_junction(
@@ -249,6 +255,10 @@ pub trait ExpressionTransform<'a> {
             Expression::Variadic(v) => {
                 let child = self.transform_expr_variadic(v);
                 map_owned_or_else(expr, child, Expression::Variadic)
+            }
+            Expression::If(i) => {
+                let child = self.transform_expr_if(i);
+                map_owned_or_else(expr, child, Expression::If)
             }
             Expression::Opaque(o) => {
                 let child = self.transform_expr_opaque(o);
@@ -389,6 +399,17 @@ pub trait ExpressionTransform<'a> {
         let right = self.transform_expr(&b.right);
         let f = |(left, right)| BinaryExpression::new(b.op, left, right);
         map_owned_pair_or_else(b, left, right, f)
+    }
+
+    /// Recursively transforms an `If` expression's three children (ternary). If any child is
+    /// filtered out the whole expression is filtered out -- a partial `If` is not meaningful.
+    fn recurse_into_expr_if(&mut self, i: &'a IfExpression) -> Self::Output<IfExpression> {
+        let condition = self.transform_pred(&i.condition);
+        let then_expr = self.transform_expr(&i.then_expr);
+        let else_expr = self.transform_expr(&i.else_expr);
+        let f =
+            |(condition, then_expr, else_expr)| IfExpression::new(condition, then_expr, else_expr);
+        map_owned_triple_or_else(i, condition, then_expr, else_expr, f)
     }
 
     /// Recursively transforms a variadic expression's children (variadic).

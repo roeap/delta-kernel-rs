@@ -314,6 +314,10 @@ impl From<&Expression> for proto_expr::Expression {
             Expression::Binary(binary) => Kind::Binary(Box::new(binary.into())),
             Expression::Variadic(variadic) => Kind::Variadic(variadic.into()),
             Expression::Opaque(opaque) => Kind::Opaque(opaque.into()),
+            // The proto wire format has no If kind yet. Degrade to Unknown, which engines must
+            // treat as non-evaluable (never as NULL), preserving correctness at the cost of
+            // rejecting plans that carry conditional expressions over the wire.
+            Expression::If(_) => Kind::Unknown("if".to_string()),
             Expression::Unknown(name) => Kind::Unknown(name.clone()),
             Expression::ParseJson(parse_json) => Kind::ParseJson(Box::new(parse_json.into())),
             Expression::MapToStruct(map_to_struct) => {

@@ -131,6 +131,46 @@ where
     })
 }
 
+/// Rebuilds a three-child parent from transformed children only when needed.
+///
+/// Like [`map_owned_pair_or_else`], but for parents with three children where the first child's
+/// type differs from the (shared) type of the other two -- e.g. `IfExpression`'s
+/// (predicate, expression, expression). If any child is filtered out, the parent is filtered out.
+/// If all three children survive as borrowed values, this returns a borrowed parent. Otherwise,
+/// it uses the provided `map_owned` function to rebuild and return an owned parent.
+pub(crate) fn map_owned_triple_or_else<'a, Parent, Child1, Child2, C1, C2, ParentCarrier, R>(
+    parent: &'a Parent,
+    first: C1,
+    second: C2,
+    third: C2,
+    map_owned: impl FnOnce((Child1::Owned, Child2::Owned, Child2::Owned)) -> Parent,
+) -> ParentCarrier
+where
+    Parent: Clone,
+    Child1: ToOwned + ?Sized + 'a,
+    Child2: ToOwned + ?Sized + 'a,
+    C1: Carrier<'a, Child1, Residual = R>,
+    C2: Carrier<'a, Child2, Residual = R>,
+    ParentCarrier: Carrier<'a, Parent, Residual = R>,
+{
+    let first = carrier_into_inner_opt!(first);
+    let second = carrier_into_inner_opt!(second);
+    let third = carrier_into_inner_opt!(third);
+    let (Some(first), Some(second), Some(third)) = (first, second, third) else {
+        // SAFETY: Only a filtering carrier could produce None => try_none must succeed.
+        carrier_try_none!();
+        unreachable!();
+    };
+    Carrier::from_inner(match (first, second, third) {
+        (Cow::Borrowed(_), Cow::Borrowed(_), Cow::Borrowed(_)) => Cow::Borrowed(parent),
+        (first, second, third) => Cow::Owned(map_owned((
+            first.into_owned(),
+            second.into_owned(),
+            third.into_owned(),
+        ))),
+    })
+}
+
 /// Rebuilds a single-child parent from a transformed child only when needed.
 ///
 /// If the child is filtered out (`None`), filter out the parent by returning `None`. If the child

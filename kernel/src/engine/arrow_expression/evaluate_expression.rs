@@ -18,6 +18,7 @@ use crate::arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
+use crate::arrow::compute::kernels::zip::zip;
 use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit,
@@ -35,9 +36,9 @@ use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
-    ExpressionRef, ExpressionStructPatch, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
-    OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    ExpressionRef, ExpressionStructPatch, IfExpression, JunctionPredicate, JunctionPredicateOp,
+    OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryExpression, UnaryExpressionOp,
+    UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, PrimitiveType, StructField, StructType};
 
@@ -341,6 +342,22 @@ pub fn evaluate_expression(
         (Variadic(VariadicExpression { op: Array, exprs }), result_type) => {
             evaluate_array_expression(exprs, batch, result_type)
         }
+        (
+            If(IfExpression {
+                condition,
+                then_expr,
+                else_expr,
+            }),
+            result_type,
+        ) => {
+            let cond = evaluate_predicate(condition, batch, false)?;
+            let then_arr = evaluate_expression(then_expr, batch, result_type)?;
+            let else_arr = evaluate_expression(else_expr, batch, result_type)?;
+            // NULL conditions are treated as false (SQL standard CASE semantics): null_to_false
+            // ensures `zip` selects from `else_arr` for those rows.
+            let cond_non_null = null_to_false(&cond);
+            Ok(zip(&cond_non_null, &then_arr, &else_arr)?)
+        }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
                 .any_ref()
@@ -484,6 +501,16 @@ fn evaluate_array_expression(
     // consistent with the other expression arms. (Element nullability is enforced above, since
     // `validate_array_type` runs in TypesAndNames mode where nullability checks are a no-op.)
     validate_array_type(Arc::new(list), result_type)
+}
+
+/// Coerces NULLs in a boolean array to `false`, matching SQL `CASE WHEN ... THEN ... ELSE ...`
+/// semantics for [`Expression::If`]. The Arrow `zip` kernel propagates NULL conditions to NULL
+/// outputs; SQL CASE evaluates a NULL condition as false (selecting the ELSE branch).
+fn null_to_false(arr: &BooleanArray) -> BooleanArray {
+    if arr.null_count() == 0 {
+        return arr.clone();
+    }
+    arr.iter().map(|v| Some(v.unwrap_or(false))).collect()
 }
 
 /// Direction for casting between Arrow view and non-view string/binary types.
@@ -750,10 +777,89 @@ pub fn evaluate_predicate(
     }
 }
 
-/// Converts a StructArray to JSON-encoded strings
+/// Converts each row's list of UTF-8-like string elements into a JSON array string column.
+///
+/// Backs `Expression::array` + [`UnaryExpressionOp::ToJson`] in evaluation, producing a
+/// JSON-encoded null-tolerant grouping key from a variable-length `List<Utf8>` tuple.
+fn list_utf8_like_to_json_strings(array_ref: &ArrayRef) -> Result<ArrayRef, ArrowError> {
+    use serde_json::Value;
+
+    fn encode_row(values: ArrayRef) -> Result<String, ArrowError> {
+        let values = match values.data_type() {
+            ArrowDataType::Utf8 => values,
+            ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => {
+                cast(&values, &ArrowDataType::Utf8)?
+            }
+            other => {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "TO_JSON list row values must be UTF-8-like strings, got {other:?}",
+                )));
+            }
+        };
+        let sa = values.as_string::<i32>();
+        let mut elems = Vec::with_capacity(sa.len());
+        for j in 0..sa.len() {
+            elems.push(if sa.is_null(j) {
+                Value::Null
+            } else {
+                Value::String(sa.value(j).to_string())
+            });
+        }
+        Ok(Value::Array(elems).to_string())
+    }
+
+    let len = array_ref.len();
+    let mut rows: Vec<Option<String>> = Vec::with_capacity(len);
+
+    match array_ref.data_type() {
+        ArrowDataType::List(_) => {
+            let la = array_ref
+                .as_list_opt::<i32>()
+                .ok_or_else(|| ArrowError::InvalidArgumentError("expected ListArray".into()))?;
+            for i in 0..len {
+                if la.is_null(i) {
+                    rows.push(None);
+                } else {
+                    rows.push(Some(encode_row(la.value(i))?));
+                }
+            }
+        }
+        ArrowDataType::LargeList(_) => {
+            let la = array_ref.as_list_opt::<i64>().ok_or_else(|| {
+                ArrowError::InvalidArgumentError("expected LargeListArray".into())
+            })?;
+            for i in 0..len {
+                if la.is_null(i) {
+                    rows.push(None);
+                } else {
+                    rows.push(Some(encode_row(la.value(i))?));
+                }
+            }
+        }
+        other => {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "internal: list_utf8_like_to_json_strings got {other:?}"
+            )));
+        }
+    }
+
+    Ok(Arc::new(StringArray::from(rows)))
+}
+
+/// Converts supported column types to JSON-encoded strings (structs, or homogeneous UTF-8 lists).
 pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
     let (array_ref, _is_scalar) = input.get();
+    let array_ref: ArrayRef = make_array(array_ref.to_data());
     match array_ref.data_type() {
+        ArrowDataType::List(inner) | ArrowDataType::LargeList(inner) => match inner.data_type() {
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => {
+                list_utf8_like_to_json_strings(&array_ref)
+            }
+            _ => Err(ArrowError::InvalidArgumentError(format!(
+                "TO_JSON supports only struct columns and UTF-8 element lists; got list of {:?}",
+                inner.data_type()
+            ))),
+        },
         ArrowDataType::Struct(_) => {
             let struct_array = array_ref.as_struct_opt().ok_or_else(|| {
                 ArrowError::InvalidArgumentError(format!(
@@ -807,7 +913,7 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
             Ok(Arc::new(array))
         }
         _ => Err(ArrowError::InvalidArgumentError(format!(
-            "TO_JSON can only be applied to struct arrays, got {:?}",
+            "TO_JSON supports only struct columns and UTF-8 element lists; got {:?}",
             array_ref.data_type()
         ))),
     }
@@ -3157,5 +3263,113 @@ mod tests {
             .column(0)
             .as_primitive::<Int32Type>();
         assert_eq!(row2_inner.value(0), 30);
+    }
+
+    #[test]
+    fn test_if_expression_basic() {
+        // IF(a < 0, 0, a) -- clamp negative values to zero.
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, true)]);
+        let a_values = Int32Array::from(vec![Some(-5), Some(0), Some(7), Some(-1)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+
+        let expr = Expr::if_then_else(column_expr!("a").lt(lit(0)), lit(0), column_expr!("a"));
+
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(result_array.values(), &[0, 0, 7, 0]);
+    }
+
+    #[test]
+    fn test_if_expression_null_condition_treated_as_false() {
+        // SQL CASE semantics: IF(<predicate that is NULL>, ..., ...) takes the ELSE branch.
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("b", ArrowDataType::Int32, true),
+        ]);
+        // a < b is NULL whenever either operand is NULL (SQL three-valued logic).
+        let a_values = Int32Array::from(vec![Some(1), None, Some(3)]);
+        let b_values = Int32Array::from(vec![Some(2), Some(2), Some(2)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(a_values), Arc::new(b_values)],
+        )
+        .unwrap();
+
+        // IF(a < b, "yes", "no") -- row 1's condition is NULL (a is NULL), so should pick "no".
+        let expr = Expr::if_then_else(
+            column_expr!("a").lt(column_expr!("b")),
+            lit("yes"),
+            lit("no"),
+        );
+
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
+        let result_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(result_array.value(0), "yes"); // 1 < 2 -> true
+        assert_eq!(result_array.value(1), "no"); // NULL < 2 -> NULL -> "no" (CASE semantics)
+        assert_eq!(result_array.value(2), "no"); // 3 < 2 -> false
+    }
+
+    #[test]
+    fn test_nested_if_expression() {
+        // IF(a < 0, "neg", IF(a > 100, "big", "ok")) -- range classifier.
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
+        let a_values = Int32Array::from(vec![-1, 50, 200, 0]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+
+        let expr = Expr::if_then_else(
+            column_expr!("a").lt(lit(0)),
+            lit("neg"),
+            Expr::if_then_else(column_expr!("a").gt(lit(100)), lit("big"), lit("ok")),
+        );
+
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING)).unwrap();
+        let result_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(result_array.value(0), "neg");
+        assert_eq!(result_array.value(1), "ok");
+        assert_eq!(result_array.value(2), "big");
+        assert_eq!(result_array.value(3), "ok");
+    }
+
+    #[test]
+    fn test_case_when_evaluates_via_nested_if() {
+        // CASE WHEN a < 0 THEN -1 WHEN a = 0 THEN 0 ELSE 1 END (sign function).
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
+        let a_values = Int32Array::from(vec![-5, 0, 7]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+
+        let expr = Expr::case_when(
+            vec![
+                (column_expr!("a").lt(lit(0)), lit(-1)),
+                (column_expr!("a").eq(lit(0)), lit(0)),
+            ],
+            lit(1),
+        );
+
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(result_array.values(), &[-1, 0, 1]);
+    }
+
+    #[test]
+    fn test_to_json_list_of_strings() {
+        // TO_JSON over List<Utf8> encodes each row's list as a JSON array string, preserving
+        // element NULLs and mapping list-level NULLs to output NULLs.
+        let field = Arc::new(ArrowField::new("item", ArrowDataType::Utf8, true));
+        let values = StringArray::from(vec![Some("a"), None, Some("c"), Some("d")]);
+        let offsets = crate::arrow::buffer::OffsetBuffer::<i32>::new(vec![0, 2, 3, 3, 4].into());
+        let nulls = NullBuffer::from(vec![true, true, false, true]);
+        let list = crate::arrow::array::ListArray::new(
+            field,
+            offsets,
+            Arc::new(values) as ArrayRef,
+            Some(nulls),
+        );
+
+        let result = to_json(&(Arc::new(list) as ArrayRef)).unwrap();
+        let result = result.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(result.value(0), r#"["a",null]"#);
+        assert_eq!(result.value(1), r#"["c"]"#);
+        assert!(result.is_null(2));
+        assert_eq!(result.value(3), r#"["d"]"#);
     }
 }

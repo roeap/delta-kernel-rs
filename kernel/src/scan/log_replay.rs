@@ -1876,6 +1876,7 @@ mod tests {
                         .map(|e| count_to_json(e))
                         .sum::<usize>()
             }
+            Expression::If(i) => count_to_json(&i.then_expr) + count_to_json(&i.else_expr),
             Expression::ParseJson(p) => count_to_json(&p.json_expr),
             Expression::MapToStruct(m) => count_to_json(&m.map_expr),
             Expression::Predicate(_)

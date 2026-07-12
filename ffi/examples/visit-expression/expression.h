@@ -72,6 +72,7 @@ enum VariadicType {
   StructExpression,
   Coalesce,
   ArrayConstructor,
+  IfTernary,
 };
 enum UnaryType { Not, IsNull };
 typedef struct {
@@ -317,6 +318,8 @@ DEFINE_VARIADIC(visit_expr_or, Or)
 DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 DEFINE_VARIADIC(visit_expr_coalesce, Coalesce)
 DEFINE_VARIADIC(visit_expr_array, ArrayConstructor)
+// The three If children arrive in a fixed-order list: condition, then-expr, else-expr.
+DEFINE_VARIADIC(visit_expr_if, IfTernary)
 #undef DEFINE_VARIADIC
 
 // Sort by field name, breaking ties by pointer address to ensure stability.
@@ -521,6 +524,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_map_to_struct = visit_map_to_struct_expr,
     .visit_coalesce = visit_expr_coalesce,
     .visit_array = visit_expr_array,
+    .visit_if = visit_expr_if,
   };
   uintptr_t top_level_id = visit_expression(&expression, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
@@ -570,6 +574,7 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_map_to_struct = visit_map_to_struct_expr,
     .visit_coalesce = visit_expr_coalesce,
     .visit_array = visit_expr_array,
+    .visit_if = visit_expr_if,
   };
   uintptr_t top_level_id = visit_predicate(&predicate, &visitor);
   ExpressionItemList top_level_expr = data.lists[top_level_id];
