@@ -103,11 +103,6 @@ package = "arrow"
 version = "58"
 features = ["chrono-tz", "ffi", "json"]
 optional = true
-[dependencies.parquet_58]
-package = "parquet"
-version = "58"
-features = ["async", "object_store"]
-optional = true
 
 # arrow 59
 [dependencies.arrow_59]
@@ -115,10 +110,36 @@ package = "arrow"
 version = "59"
 features = ["chrono-tz", "ffi", "json"]
 optional = true
-[dependencies.parquet_59]
+
+# parquet is target-gated for the same reason as object_store above: its default `zstd`
+# codec links zstd-sys (C code) which does not build for wasm32-unknown-unknown. Off-wasm
+# keeps parquet defaults; on wasm only the pure-Rust snap and lz4 codecs stay
+# (zstd links C; brotli/flate2 need extra backend wiring), so pages using other codecs
+# become unreadable there.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies.parquet_58]
+package = "parquet"
+version = "58"
+features = ["async", "object_store"]
+optional = true
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies.parquet_59]
 package = "parquet"
 version = "59"
 features = ["async", "object_store"]
+optional = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies.parquet_58]
+package = "parquet"
+version = "58"
+default-features = false
+features = ["arrow", "snap", "lz4", "base64", "async", "object_store"]
+optional = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies.parquet_59]
+package = "parquet"
+version = "59"
+default-features = false
+features = ["arrow", "snap", "lz4", "base64", "async", "object_store"]
 optional = true
 
 [features]
