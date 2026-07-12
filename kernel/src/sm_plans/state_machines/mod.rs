@@ -9,3 +9,4 @@
 //! [`EngineResponse`]: framework::step_payload::EngineResponse
 
 pub mod framework;
+pub mod scan;

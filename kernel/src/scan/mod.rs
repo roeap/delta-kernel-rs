@@ -394,6 +394,14 @@ impl ScanBuilder {
             partition_values: self.partition_values,
         })
     }
+
+    /// Build a [`Scan`] for declarative replay, returning a state-machine-plans
+    /// [`crate::sm_plans::errors::DeltaError`] on failure.
+    #[cfg(feature = "sm-plans")]
+    pub fn build_replay(self) -> Result<Scan, crate::sm_plans::errors::DeltaError> {
+        use crate::sm_plans::errors::KernelErrAsDelta;
+        self.build().map_err(|e| e.into_delta_default())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -671,6 +679,42 @@ impl Scan {
     /// Whether stats reading is entirely skipped, disabling internal data skipping.
     fn skip_stats(&self) -> bool {
         !self.stats.synthesize_json && matches!(self.stats.struct_stats, StructStats::None)
+    }
+
+    /// Get the physical stats schema used for `stats_parsed` in scan metadata.
+    #[cfg(feature = "sm-plans")]
+    pub(crate) fn physical_stats_schema(&self) -> Option<SchemaRef> {
+        self.state_info.physical_stats_schema.clone()
+    }
+
+    /// Get the physical partition schema used for `partitionValues_parsed` in scan metadata.
+    #[cfg(feature = "sm-plans")]
+    pub(crate) fn physical_partition_schema(&self) -> Option<SchemaRef> {
+        self.state_info.physical_partition_schema.clone()
+    }
+
+    /// Internal accessor for the scan's [`StateInfo`]. The scan SM data stage uses the
+    /// precomputed transform spec to drive its physical->logical projection instead of
+    /// re-deriving partition / row-id / row-index classification from the snapshot.
+    #[cfg(feature = "sm-plans")]
+    pub(crate) fn state_info(&self) -> &StateInfo {
+        &self.state_info
+    }
+
+    /// Partition schema for the scan SM's data stage projection.
+    ///
+    /// The data stage's `scan_data_projection` references
+    /// `fileConstantValues.partitionValues_parsed.<col>` for every partition column appearing
+    /// in the logical schema, regardless of predicate. `physical_partition_schema()` is gated
+    /// on predicate-driven data skipping (or the parsed-struct option), so it can be `None`
+    /// for unfiltered partitioned reads -- which would leave `partitionValues_parsed`
+    /// unmaterialized and break the data-stage projection lookup. Returns the table's full
+    /// partition schema instead.
+    #[cfg(feature = "sm-plans")]
+    pub(crate) fn data_stage_partition_schema(&self) -> Option<SchemaRef> {
+        self.snapshot
+            .table_configuration()
+            .partition_schema_with_physical_names()
     }
 
     /// Build the read-options bundle passed to [`ScanLogReplayProcessor`].

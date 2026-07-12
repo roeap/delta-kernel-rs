@@ -398,6 +398,24 @@ pub(crate) mod test_utils {
             .unwrap()
     }
 
+    /// Parse a `StringArray` of JSON rows against the given schema using a [`SyncEngine`],
+    /// and return the resulting Arrow `RecordBatch`. Convenience for tests that build a
+    /// small fixture batch from JSON literals.
+    pub(crate) fn parse_json_to_record_batch(
+        rows: StringArray,
+        schema: crate::schema::SchemaRef,
+    ) -> RecordBatch {
+        let engine = SyncEngine::new();
+        let parsed = engine
+            .json_handler()
+            .parse_json(string_array_to_engine_data(rows), schema)
+            .unwrap();
+        ArrowEngineData::try_from_engine_data(parsed)
+            .unwrap()
+            .record_batch()
+            .clone()
+    }
+
     pub(crate) fn action_batch() -> Box<dyn EngineData> {
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
