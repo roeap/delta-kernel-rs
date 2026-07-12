@@ -647,6 +647,7 @@ impl HasSelectionVector for ScanMetadata {
 
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
+#[derive(Clone)]
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
