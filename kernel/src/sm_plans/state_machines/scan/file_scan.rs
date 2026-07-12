@@ -410,4 +410,195 @@ mod tests {
         assert_eq!(exprs[1].as_ref(), &expected_row_id);
         assert_eq!(exprs[2].as_ref(), &col(["row_index"]));
     }
+
+    // === SM drive tests (real tables, SyncEngine snapshot) ================================
+
+    mod drive {
+        use std::collections::HashMap;
+
+        use url::Url;
+
+        use super::super::*;
+        use crate::engine::arrow_conversion::TryIntoKernel;
+        use crate::engine::sync::SyncEngine;
+        use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use crate::schema::SchemaRef;
+        use crate::sm_plans::ir::nodes::FileType;
+        use crate::sm_plans::ir::plan::{NodeKind, PlanNode};
+        use crate::sm_plans::state_machines::framework::state_machine::{NextStep, StateMachine};
+        use crate::sm_plans::state_machines::framework::step::EngineRequest;
+        use crate::sm_plans::state_machines::framework::step_payload::EngineResponse;
+        use crate::snapshot::Snapshot;
+        use crate::SnapshotRef;
+
+        fn snapshot_for(table_rel_path: &str) -> SnapshotRef {
+            let path = std::fs::canonicalize(table_rel_path).unwrap();
+            let url = Url::from_directory_path(path).unwrap();
+            Snapshot::builder_for(url)
+                .build(&SyncEngine::new())
+                .unwrap()
+        }
+
+        /// Answer a footer [`EngineRequest::SchemaQuery`] by actually reading the parquet
+        /// footer of the referenced file, mirroring what a real engine executor does.
+        fn footer_schema(file_path: &str) -> SchemaRef {
+            let path = Url::parse(file_path).unwrap().to_file_path().unwrap();
+            let file = std::fs::File::open(path).unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+            let kernel_schema: crate::schema::StructType =
+                builder.schema().as_ref().try_into_kernel().unwrap();
+            Arc::new(kernel_schema)
+        }
+
+        /// Drive `sm` through the get_step/submit loop to completion, answering schema
+        /// queries with real footer reads. Panics on `Consume` steps -- callers pick tables
+        /// whose pipelines resolve without consumer drains. Returns the terminal result and
+        /// the number of schema queries answered.
+        fn drive_schema_only<R>(sm: &mut CoroutineSM<R>) -> (R, usize) {
+            let mut answered = 0;
+            loop {
+                let resp = match sm.get_step() {
+                    Ok(EngineRequest::SchemaQuery(q)) => {
+                        answered += 1;
+                        EngineResponse::Schema(footer_schema(&q.file_path))
+                    }
+                    Ok(EngineRequest::Consume { .. }) => {
+                        panic!("test table should not require consume steps")
+                    }
+                    // Zero-yield SM: no pending operation; submit the priming value to
+                    // collect the terminal result.
+                    Err(_) => EngineResponse::Empty,
+                };
+                match sm.submit(Ok(resp)).unwrap() {
+                    NextStep::Continue => continue,
+                    NextStep::Done(r) => return (r, answered),
+                }
+            }
+        }
+
+        /// Collect `(file_type, file paths)` for every file source in the plan. Sources appear
+        /// either as direct `Scan` nodes (files inline) or as `Values(path rows) -> Load` chains
+        /// (the reconciliation's file-listing shape).
+        fn scan_sources(result: &ResultPlan) -> Vec<(FileType, Vec<String>)> {
+            let by_output: HashMap<_, _> = result
+                .plan
+                .stmts
+                .iter()
+                .map(|node| (node.output, node))
+                .collect();
+            let values_paths = |node: &PlanNode| -> Vec<String> {
+                let NodeKind::Values(values) = &node.kind else {
+                    return Vec::new();
+                };
+                let Some(path_idx) = values
+                    .schema
+                    .fields()
+                    .position(|f| f.name() == "path" || f.name() == "file_path")
+                else {
+                    return Vec::new();
+                };
+                values
+                    .rows
+                    .iter()
+                    .filter_map(|row| match &row[path_idx] {
+                        crate::expressions::Scalar::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            result
+                .plan
+                .stmts
+                .iter()
+                .filter_map(|node| match &node.kind {
+                    NodeKind::Scan(scan) => Some((
+                        scan.file_type,
+                        scan.files.iter().map(|f| f.location.to_string()).collect(),
+                    )),
+                    NodeKind::Load(load) => {
+                        let paths: Vec<String> = node
+                            .inputs
+                            .iter()
+                            .filter_map(|r| by_output.get(r))
+                            .flat_map(|n| values_paths(n))
+                            .collect();
+                        Some((load.file_type, paths))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn scan_metadata_sm_commit_only_table_yields_plan_over_commit_files() {
+            let snapshot = snapshot_for("./tests/data/basic_partitioned");
+            let scan = snapshot.scan_replay_builder().build_replay().unwrap();
+            let mut sm = scan.scan_metadata_state_machine().unwrap();
+
+            let (result, schema_queries) = drive_schema_only(&mut sm);
+            assert_eq!(
+                schema_queries, 0,
+                "commit-only table must not need footer probes"
+            );
+
+            // The reconciliation must source exactly the snapshot's two commit files as JSON.
+            let sources = scan_sources(&result);
+            let json_files: Vec<_> = sources
+                .iter()
+                .filter(|(ft, _)| *ft == FileType::Json)
+                .flat_map(|(_, files)| files.iter())
+                .collect();
+            assert!(
+                json_files
+                    .iter()
+                    .any(|f| f.ends_with("00000000000000000000.json"))
+                    && json_files
+                        .iter()
+                        .any(|f| f.ends_with("00000000000000000001.json")),
+                "expected both commit files in the plan, got: {json_files:?}"
+            );
+            assert!(
+                !sources.iter().any(|(ft, _)| *ft == FileType::Parquet),
+                "commit-only table must not scan parquet checkpoints"
+            );
+        }
+
+        #[test]
+        fn scan_metadata_sm_checkpoint_table_probes_footer_and_scans_checkpoint() {
+            let snapshot = snapshot_for("./tests/data/with_checkpoint_no_last_checkpoint");
+            let scan = snapshot.scan_replay_builder().build_replay().unwrap();
+            let mut sm = scan.scan_metadata_state_machine().unwrap();
+
+            let (result, schema_queries) = drive_schema_only(&mut sm);
+            assert!(
+                schema_queries >= 1,
+                "checkpoint without a usable hint schema requires a footer probe"
+            );
+
+            let sources = scan_sources(&result);
+            let parquet_files: Vec<_> = sources
+                .iter()
+                .filter(|(ft, _)| *ft == FileType::Parquet)
+                .flat_map(|(_, files)| files.iter())
+                .collect();
+            assert!(
+                parquet_files
+                    .iter()
+                    .any(|f| f.ends_with("00000000000000000002.checkpoint.parquet")),
+                "expected the checkpoint parquet in the plan, got: {parquet_files:?}"
+            );
+            // Commits after the checkpoint must still be replayed as JSON.
+            let json_files: Vec<_> = sources
+                .iter()
+                .filter(|(ft, _)| *ft == FileType::Json)
+                .flat_map(|(_, files)| files.iter())
+                .collect();
+            assert!(
+                json_files
+                    .iter()
+                    .any(|f| f.ends_with("00000000000000000003.json")),
+                "expected post-checkpoint commit in the plan, got: {json_files:?}"
+            );
+        }
+    }
 }
