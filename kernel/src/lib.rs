@@ -107,6 +107,10 @@ pub mod partition;
 pub mod plans;
 pub mod scan;
 pub mod schema;
+/// SSA plan IR and coroutine state-machine framework where the engine drives execution
+/// through a get_step/submit loop. Opt-in; independent of the `plans` PlanExecutor API.
+#[cfg(feature = "sm-plans")]
+pub mod sm_plans;
 pub mod snapshot;
 pub mod struct_patch;
 pub mod table_changes;

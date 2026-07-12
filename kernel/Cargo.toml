@@ -60,6 +60,13 @@ uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
 
 # optional deps
+# dyn-clone: `Clone` for `Box<dyn KernelConsumer>` trait objects via the
+# `DynClone` supertrait. Blanket impl covers any `Clone` KDF state, so
+# concrete KDFs don't write their own `clone_boxed`.
+dyn-clone = { version = "1.0", optional = true }
+# genawaiter2: single-threaded (rc, not sync) coroutines backing the sm-plans
+# CoroutineSM driver.
+genawaiter2 = { version = "0.100", optional = true }
 # `reqwest` is only needed for the gated `Error::Reqwest` variant; the actual HTTP client
 # lives in the `delta_kernel_default_engine` crate now.
 reqwest = { version = "0.13", default-features = false, optional = true }
@@ -116,6 +123,16 @@ schema-diff = []
 
 # Declarative plan IR (experimental).
 declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc-bin-vendored"]
+
+# SSA plan IR + coroutine state-machine framework (experimental). The engine drives
+# each state machine through a get_step/submit loop and executes the yielded plans
+# itself. Independent of (and composable with) `declarative-plans`.
+#
+# Enables:
+#   - `internal-api` -- the SSA IR uses kernel-internal types (most notably
+#     `schema::ToSchema`) hidden under `#[internal_api]`.
+#   - `arrow` -- KDF consumer impls return Arrow-typed views over each batch.
+sm-plans = ["internal-api", "arrow", "dep:dyn-clone", "dep:genawaiter2"]
 
 # Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
 # work. TODO(#2630): remove once full column-defaults support ships.
