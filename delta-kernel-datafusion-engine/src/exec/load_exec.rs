@@ -21,7 +21,7 @@ use datafusion_physical_plan::{
 };
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use delta_kernel::plans::ir::nodes::{FileType, LoadNode};
+use delta_kernel::sm_plans::ir::nodes::{FileType, LoadNode};
 use delta_kernel::Engine;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 
@@ -183,15 +183,6 @@ impl ExecutionPlan for LoadExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.upstream]
-    }
-
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(
-            &dyn datafusion_physical_expr_common::physical_expr::PhysicalExpr,
-        ) -> DfResult<datafusion_common::tree_node::TreeNodeRecursion>,
-    ) -> DfResult<datafusion_common::tree_node::TreeNodeRecursion> {
-        Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

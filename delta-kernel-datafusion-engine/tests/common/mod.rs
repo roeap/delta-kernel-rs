@@ -9,7 +9,7 @@
 use std::any::Any;
 
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::plans::kernel_consumers::{KdfControl, KernelConsumer, KernelConsumerKind};
+use delta_kernel::sm_plans::kernel_consumers::{KdfControl, KernelConsumer, KernelConsumerKind};
 use delta_kernel::{DeltaResult, EngineData};
 
 /// Consumer KDF that accumulates the total number of rows seen across all batches and finishes

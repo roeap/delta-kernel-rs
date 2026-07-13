@@ -23,8 +23,8 @@ use datafusion_functions_nested::expr_fn::{array_transform, make_array};
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
-    Expression, IfExpression, JunctionPredicate, JunctionPredicateOp, MapToStructExpression,
-    ParseJsonExpression, Predicate, Scalar, StructData, Transform, UnaryPredicate,
+    Expression, ExpressionStructPatch, IfExpression, JunctionPredicate, JunctionPredicateOp,
+    MapToStructExpression, ParseJsonExpression, Predicate, Scalar, StructData, UnaryPredicate,
     UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
@@ -82,7 +82,7 @@ pub fn kernel_expr_to_df(
     match expr {
         Expression::ParseJson(parse_json) => return parse_json_to_df(parse_json),
         Expression::MapToStruct(map_to_struct) => return map_to_struct_to_df(map_to_struct, cx),
-        Expression::Transform(transform) => return transform_to_df(transform, cx),
+        Expression::StructPatch(patch) => return transform_to_df(patch, cx),
         Expression::Struct(children, nullability_predicate) => {
             return struct_to_df(children.as_slice(), nullability_predicate.as_ref(), cx);
         }
@@ -116,7 +116,7 @@ pub fn kernel_expr_to_df(
         // Already handled above and returned early.
         Expression::ParseJson(_)
         | Expression::MapToStruct(_)
-        | Expression::Transform(_)
+        | Expression::StructPatch(_)
         | Expression::Struct(_, _) => {
             return Err(crate::error::internal_error(
                 "expr_translator: target-shaping arm fell through; should have returned early",
@@ -196,10 +196,12 @@ fn map_to_struct_to_df(
 /// Identity `Transform` with a Struct target encodes column-mapping physical->logical
 /// rename for struct columns. Non-identity transforms are not yet supported.
 fn transform_to_df(
-    transform: &Transform,
+    transform: &ExpressionStructPatch,
     cx: &TranslationContext<'_>,
 ) -> Result<Expr, DataFusionError> {
-    if !transform.is_identity() {
+    // An identity struct-patch (no field edits) is the column-mapping physical->logical rename;
+    // `is_empty()` is the upstream successor to the old `Transform::is_identity()`.
+    if !transform.is_empty() {
         return Err(unsupported(
             "Non-identity Transform expressions are not yet supported",
         ));
@@ -479,25 +481,34 @@ fn scalar_struct_value_to_df(struct_data: &StructData) -> Result<ScalarValue, Da
 
 fn typed_null_to_df(data_type: &DataType) -> Result<ScalarValue, DataFusionError> {
     if let DataType::Primitive(p) = data_type {
-        return Ok(match p {
-            PrimitiveType::Integer => ScalarValue::Int32(None),
-            PrimitiveType::Long => ScalarValue::Int64(None),
-            PrimitiveType::Short => ScalarValue::Int16(None),
-            PrimitiveType::Byte => ScalarValue::Int8(None),
-            PrimitiveType::Float => ScalarValue::Float32(None),
-            PrimitiveType::Double => ScalarValue::Float64(None),
-            PrimitiveType::String => ScalarValue::Utf8(None),
-            PrimitiveType::Boolean => ScalarValue::Boolean(None),
-            PrimitiveType::Date => ScalarValue::Date32(None),
-            PrimitiveType::Timestamp => {
-                ScalarValue::TimestampMicrosecond(None, Some(Arc::from("UTC")))
-            }
-            PrimitiveType::TimestampNtz => ScalarValue::TimestampMicrosecond(None, None),
-            PrimitiveType::Binary => ScalarValue::Binary(None),
-            PrimitiveType::Decimal(d) => {
-                ScalarValue::Decimal128(None, d.precision(), d.scale() as i8)
-            }
-        });
+        // Common primitives get a direct mapping; anything else (incl. Void / interval types)
+        // falls through to the generic arrow conversion below.
+        let mapped = match p {
+            PrimitiveType::Integer => Some(ScalarValue::Int32(None)),
+            PrimitiveType::Long => Some(ScalarValue::Int64(None)),
+            PrimitiveType::Short => Some(ScalarValue::Int16(None)),
+            PrimitiveType::Byte => Some(ScalarValue::Int8(None)),
+            PrimitiveType::Float => Some(ScalarValue::Float32(None)),
+            PrimitiveType::Double => Some(ScalarValue::Float64(None)),
+            PrimitiveType::String => Some(ScalarValue::Utf8(None)),
+            PrimitiveType::Boolean => Some(ScalarValue::Boolean(None)),
+            PrimitiveType::Date => Some(ScalarValue::Date32(None)),
+            PrimitiveType::Timestamp => Some(ScalarValue::TimestampMicrosecond(
+                None,
+                Some(Arc::from("UTC")),
+            )),
+            PrimitiveType::TimestampNtz => Some(ScalarValue::TimestampMicrosecond(None, None)),
+            PrimitiveType::Binary => Some(ScalarValue::Binary(None)),
+            PrimitiveType::Decimal(d) => Some(ScalarValue::Decimal128(
+                None,
+                d.precision(),
+                d.scale() as i8,
+            )),
+            _ => None,
+        };
+        if let Some(scalar) = mapped {
+            return Ok(scalar);
+        }
     }
 
     let arrow_dt: ArrowDataType = data_type.try_into_arrow().map_err(|e| {

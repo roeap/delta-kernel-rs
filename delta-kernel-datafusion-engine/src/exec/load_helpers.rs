@@ -32,7 +32,7 @@ use delta_kernel::arrow::datatypes::{
     SchemaRef as ArrowSchemaRef,
 };
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::plans::ir::nodes::{FileType, LoadNode};
+use delta_kernel::sm_plans::ir::nodes::{FileType, LoadNode};
 use delta_kernel::Engine;
 use parquet::arrow::RowNumber;
 use roaring::RoaringTreemap;
@@ -277,14 +277,18 @@ pub(crate) fn build_file_source(
         .iter()
         .map(|f| Arc::new(strip_field_metadata_recursive(f.as_ref())))
         .collect();
-    let mut table_schema = TableSchema::new(file_arrow_schema, stripped_passthrough_fields);
+    // DF main's `TableSchema` is builder-constructed; virtual columns (the parquet `_row_number`,
+    // set when row-tracking is on for parquet) go through `with_virtual_columns` on the builder.
+    let mut builder = TableSchema::builder(file_arrow_schema)
+        .with_table_partition_cols(stripped_passthrough_fields);
     if include_row_number && matches!(file_type, FileType::Parquet) {
         let virt_field: FieldRef = Arc::new(
             ArrowField::new(ROW_NUMBER_COL, ArrowDataType::Int64, false)
                 .with_extension_type(RowNumber),
         );
-        table_schema = table_schema.with_virtual_columns(vec![virt_field]);
+        builder = builder.with_virtual_columns(vec![virt_field]);
     }
+    let table_schema = builder.build();
     let source: Arc<dyn FileSource> = match file_type {
         FileType::Parquet => Arc::new(ParquetSource::new(table_schema)),
         FileType::Json => Arc::new(JsonSource::new(table_schema)),

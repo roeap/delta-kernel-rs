@@ -13,7 +13,7 @@ mod common;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::Scan;
 use delta_kernel::{Engine as KernelEngine, Snapshot};

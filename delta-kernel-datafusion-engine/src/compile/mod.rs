@@ -18,7 +18,7 @@ pub use logical::compile_ssa;
 /// Carries only static / shared bits -- there is no per-phase mutable accumulator
 /// here. Drained consumer state for `Consume` steps flows directly out of
 /// [`DataFusionExecutor::run_phase`](crate::executor::DataFusionExecutor) as a
-/// [`EngineResponse::Consumer`](delta_kernel::plans::state_machines::framework::step_payload::EngineResponse::Consumer)
+/// [`EngineResponse::Consumer`](delta_kernel::sm_plans::state_machines::framework::step_payload::EngineResponse::Consumer)
 /// after the executor finishes the sink locally.
 #[derive(Clone)]
 pub struct CompileContext {

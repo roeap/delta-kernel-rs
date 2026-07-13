@@ -1,12 +1,12 @@
-//! SSA [`Plan`](delta_kernel::plans::ir::plan::Plan) -> DataFusion [`LogicalPlan`] lowering.
+//! SSA [`Plan`](delta_kernel::sm_plans::ir::plan::Plan) -> DataFusion [`LogicalPlan`] lowering.
 //!
-//! Topological walk over [`PlanNode`](delta_kernel::plans::ir::plan::PlanNode)s. Each statement's
-//! output [`Ref`](delta_kernel::plans::ir::plan::Ref) is mapped to a freshly built
+//! Topological walk over [`PlanNode`](delta_kernel::sm_plans::ir::plan::PlanNode)s. Each statement's
+//! output [`Ref`](delta_kernel::sm_plans::ir::plan::Ref) is mapped to a freshly built
 //! [`LogicalPlan`]. Inputs are guaranteed to be earlier in `plan.stmts` than outputs by
-//! [`Plan::push`](delta_kernel::plans::ir::plan::Plan::push), so a single forward pass works.
+//! [`Plan::push`](delta_kernel::sm_plans::ir::plan::Plan::push), so a single forward pass works.
 //!
-//! Every [`NodeKind`](delta_kernel::plans::ir::plan::NodeKind) variant wraps a payload struct
-//! defined in [`delta_kernel::plans::ir::nodes`]; engine helpers consume those payload structs
+//! Every [`NodeKind`](delta_kernel::sm_plans::ir::plan::NodeKind) variant wraps a payload struct
+//! defined in [`delta_kernel::sm_plans::ir::nodes`]; engine helpers consume those payload structs
 //! by reference (`&LoadNode`, `&ScanNode`, etc.) without repacking. Cross-statement data flow
 //! happens entirely through DataFusion's logical-plan tree (no relation registry, no named
 //! handles).
@@ -14,13 +14,13 @@
 //! # Schema policy
 //!
 //! SSA `Plan`s do not carry per-Ref kernel schemas (those live on the
-//! [`ContextState`](crate::plans::state_machines::framework::plan_context) only during
+//! [`ContextState`](delta_kernel::sm_plans::state_machines::framework::plan_context) only during
 //! construction). DataFusion derives output schemas from `LogicalPlan` shape and arrow
 //! types; the only place a kernel [`SchemaRef`] is reconstructed engine-side is
 //! [`NodeKind::Load`], whose output schema is computed here from the upstream's arrow shape
 //! via [`StructType::try_from_arrow`] and threaded into [`LoadTableProvider::try_new`].
 //!
-//! [`NodeKind::Load`]: delta_kernel::plans::ir::plan::NodeKind::Load
+//! [`NodeKind::Load`]: delta_kernel::sm_plans::ir::plan::NodeKind::Load
 //! [`SchemaRef`]: delta_kernel::schema::SchemaRef
 //! [`StructType::try_from_arrow`]: delta_kernel::engine::arrow_conversion::TryFromArrow
 //! [`LoadTableProvider`]: crate::exec::LoadTableProvider
@@ -38,11 +38,11 @@ use datafusion_expr::{lit, Expr, ExprFunctionExt, JoinType as DfJoinType, Logica
 use datafusion_functions_window::row_number::row_number;
 use delta_kernel::engine::arrow_conversion::{TryFromArrow, TryIntoArrow};
 use delta_kernel::expressions::{ColumnName, Expression};
-use delta_kernel::plans::ir::nodes::{
+use delta_kernel::schema::{SchemaRef, StructType};
+use delta_kernel::sm_plans::ir::nodes::{
     EquiJoinNode, LoadNode, MaxByVersionNode, UnionNode, ValuesNode,
 };
-use delta_kernel::plans::ir::plan::{JoinKind, NodeKind, PlanNode, Ref};
-use delta_kernel::schema::{SchemaRef, StructType};
+use delta_kernel::sm_plans::ir::plan::{JoinKind, NodeKind, PlanNode, Ref};
 
 use super::canonicalize::canonicalize_output_to_kernel_schema;
 use super::ordered_union::compile_ordered_union;
@@ -62,13 +62,13 @@ use crate::exec::LoadTableProvider;
 /// into a `Ref`-keyed map. The plan returned for `terminal` is then handed back. Statements
 /// unreachable from `terminal` are still compiled (DCE is the builder's job, not the engine's);
 /// engines relying on dead-code elimination should call
-/// [`Plan::reachable_from`](delta_kernel::plans::ir::plan::Plan::reachable_from) before passing
+/// [`Plan::reachable_from`](delta_kernel::sm_plans::ir::plan::Plan::reachable_from) before passing
 /// the stmts in. Taking `&[PlanNode]` rather than `&Plan` avoids needing a `Plan::from_stmts`
-/// constructor; both the [`ResultPlan`](delta_kernel::plans::ir::plan::ResultPlan)-returning
+/// constructor; both the [`ResultPlan`](delta_kernel::sm_plans::ir::plan::ResultPlan)-returning
 /// drive path (where the caller already has a `Plan`) and the [`EngineRequest::Consume`] dispatch
 /// (where the executor only sees raw stmts) share this entry point.
 ///
-/// [`EngineRequest::Consume`]: delta_kernel::plans::state_machines::framework::step::EngineRequest::Consume
+/// [`EngineRequest::Consume`]: delta_kernel::sm_plans::state_machines::framework::step::EngineRequest::Consume
 pub fn compile_ssa(
     stmts: &[PlanNode],
     terminal: Ref,

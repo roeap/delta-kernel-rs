@@ -14,8 +14,8 @@
 //! dev-dependency on this crate.
 
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::plan::ResultPlan;
+use delta_kernel::sm_plans::errors::DeltaError;
+use delta_kernel::sm_plans::ir::plan::ResultPlan;
 
 use crate::error::DfResultIntoDelta;
 use crate::DataFusionExecutor;

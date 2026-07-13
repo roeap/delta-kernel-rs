@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion_common::assert_batches_sorted_eq;
-use delta_kernel::engine::default::DefaultEngineBuilder;
+use delta_kernel_default_engine::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::{Engine as KernelEngine, Snapshot};
 use delta_kernel_datafusion_engine::DataFusionExecutor;

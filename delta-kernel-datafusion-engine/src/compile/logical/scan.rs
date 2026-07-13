@@ -1,4 +1,4 @@
-//! Lowering for [`NodeKind::Scan`](delta_kernel::plans::ir::plan::NodeKind::Scan) plus row-index
+//! Lowering for [`NodeKind::Scan`](delta_kernel::sm_plans::ir::plan::NodeKind::Scan) plus row-index
 //! plumbing helpers shared with [`super::ordered_union`].
 
 use std::sync::Arc;
@@ -18,8 +18,8 @@ use datafusion_datasource_parquet::file_format::ParquetFormat;
 use datafusion_expr::logical_plan::{EmptyRelation, LogicalPlan};
 use datafusion_expr::LogicalPlanBuilder;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::plans::ir::nodes::{FileType, ScanNode};
 use delta_kernel::schema::MetadataColumnSpec;
+use delta_kernel::sm_plans::ir::nodes::{FileType, ScanNode};
 use parquet::arrow::RowNumber;
 
 use super::canonicalize::canonicalize_output_to_kernel_schema;
@@ -62,18 +62,10 @@ pub(super) fn scan_to_listing_logical_plan(
                     FileType::Json => ".json",
                 })
                 .with_table_partition_cols(partition_cols)
-                // Match the upstream `collect_statistics` default (apache/datafusion PR #16080).
-                // DataFusion's own stats collector (`statistics_from_parquet_metadata`) looks
-                // columns up by name on the logical file schema: when a logical
-                // name doesn't exist physically (column-mapping rename, Parquet
-                // field-ID matching), it stamps the column as `null_count ==
-                // num_rows`, and `constant_columns_from_stats` then rewrites the
-                // projection's column reference into `Literal::NULL` BEFORE the field-id root
-                // rename (see `field_id_projection.rs` in the fork) can take
-                // effect. Kernel does its own file-level skipping, so the DF stats
-                // path is redundant here.
-                .with_collect_stat(false)
-                .with_target_partitions(1);
+                // Statistics collection and single-partition execution are set at the SessionConfig
+                // level (DF main removed `ListingOptions::with_collect_stat` /
+                // `with_target_partitions`); see the executor's session setup for the rationale.
+                ;
             let paths = files
                 .iter()
                 .map(|f| ListingTableUrl::parse(f.location.as_str()))

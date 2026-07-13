@@ -1,44 +1,60 @@
+# Standalone crate: detached from the parent workspace so its DataFusion (git main) dependency
+# graph resolves independently. This is a proof-of-concept port; not a workspace member.
+[workspace]
+
 [package]
 name = "delta-kernel-datafusion-engine"
 description = "DataFusion-backed executor scaffold for Delta Kernel declarative plans (Phase 1.1)."
-edition.workspace = true
-homepage.workspace = true
-license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
-version.workspace = true
+edition = "2021"
+homepage = "https://delta.io"
+license = "Apache-2.0"
+repository = "https://github.com/delta-io/delta-kernel-rs"
+rust-version = "1.88"
+version = "0.25.0"
 
 [dependencies]
-# Match default-executor: declarative IR + Arrow/Tokio engine so `delta_kernel::engine` and
-# `delta_kernel::arrow` resolve consistently.
+# Local `sm_plans` module (their `plans` / `declarative-plans`) plus the Arrow/Tokio engine.
+# DataFusion main is on arrow 59, matching kernel's default `arrow` (= arrow-59), so the whole
+# graph is a single arrow-59 stack.
 delta_kernel = { path = "../kernel", default-features = false, features = [
-    "declarative-plans",
-    "default-engine-rustls",
-    "arrow",
+    "sm-plans",
+    "default-engine-base",
+    "arrow-59",
     "internal-api",
 ] }
+# Kernel pulls reqwest with no TLS backend (it expects the downstream engine crate to pick one,
+# like the `default-engine` crate does). Select rustls here; feature unification enables it on
+# kernel's reqwest. Upstream kernel has no `default-engine-rustls` alias (that was fork-local).
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# Upstream splits the DefaultEngine into its own crate (their fork re-exported it as
+# `delta_kernel::engine::default`).
+delta_kernel_default_engine = { path = "../default-engine", default-features = false, features = ["arrow-59", "rustls"] }
 
-datafusion-common = { version = "53", default-features = false }
-datafusion = { version = "53", default-features = false }
-datafusion-catalog-listing = { version = "53", default-features = false }
-datafusion-expr = { version = "53", default-features = false }
-datafusion-execution = { version = "53", default-features = false }
-datafusion-physical-expr = { version = "53", default-features = false }
-datafusion-physical-expr-adapter = { version = "53", default-features = false }
-datafusion-physical-expr-common = { version = "53", default-features = false }
-datafusion-physical-plan = { version = "53", default-features = false }
-datafusion-physical-optimizer = { version = "53", default-features = false }
-datafusion-functions-window = { version = "53", default-features = false }
-datafusion-functions = { version = "53", default-features = false }
-datafusion-functions-nested = { version = "53", default-features = false }
-datafusion-functions-json = { version = "0.53", default-features = false }
-datafusion-datasource = { version = "53", default-features = false }
-datafusion-datasource-json = { version = "53", default-features = false }
-datafusion-datasource-parquet = { version = "53", default-features = false }
+# DataFusion is pinned to git `main` (not a crates.io release): main carries PR #22026, which
+# plumbs the parquet `row_number` virtual column through `TableSchema` / `ParquetOpener` -- the
+# mechanism the load path needs for deletion-vector reads. The `version` reqs below are satisfied
+# by the versions main declares; the [patch.crates-io] block at the bottom redirects the source.
+datafusion-common = { version = "54", default-features = false }
+datafusion = { version = "54", default-features = false }
+datafusion-catalog-listing = { version = "54", default-features = false }
+datafusion-expr = { version = "54", default-features = false }
+datafusion-execution = { version = "54", default-features = false }
+datafusion-physical-expr = { version = "54", default-features = false }
+datafusion-physical-expr-adapter = { version = "54", default-features = false }
+datafusion-physical-expr-common = { version = "54", default-features = false }
+datafusion-physical-plan = { version = "54", default-features = false }
+datafusion-physical-optimizer = { version = "54", default-features = false }
+datafusion-functions-window = { version = "54", default-features = false }
+datafusion-functions = { version = "54", default-features = false }
+datafusion-functions-nested = { version = "54", default-features = false }
+datafusion-functions-json = { version = "0.54", default-features = false }
+datafusion-datasource = { version = "54", default-features = false }
+datafusion-datasource-json = { version = "54", default-features = false }
+datafusion-datasource-parquet = { version = "54", default-features = false }
 
 # Native parquet virtual columns (`RowNumber`) share arrow-rs APIs with DataFusion's parquet crate.
-parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
-arrow-json = { version = "58", default-features = false }
+parquet = { version = "59", default-features = false, features = ["arrow", "async"] }
+arrow-json = { version = "59", default-features = false }
 
 async-stream = "0.3"
 async-trait = "0.1"
@@ -62,10 +78,33 @@ test-utils = []
 # Self-dep activates the `test-utils` feature for this crate's own integration tests in
 # `tests/`. Matches the pattern in `kernel/Cargo.toml`.
 delta-kernel-datafusion-engine = { path = ".", features = ["test-utils"] }
-parquet = { version = "58", default-features = false, features = ["arrow"] }
+parquet = { version = "59", default-features = false, features = ["arrow"] }
 rstest = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-test_utils = { path = "../test-utils" }
+test_utils = { path = "../test-utils", default-features = false, features = ["arrow-59"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Redirect every first-party datafusion crate to a single pinned `main` commit that includes
+# PR #22026 (parquet virtual columns). This rev is the last main commit on arrow/parquet 59.0
+# (the immediate parent of the 59.1.0 bump #23312); 59.0 matches kernel's `arrow-59` dep and the
+# arrow version available in the registry. Bump both this rev and kernel's arrow pin together when
+# moving to arrow 59.1. Pinned by rev for reproducibility.
+[patch.crates-io]
+datafusion = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-common = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-catalog-listing = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-expr = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-execution = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-physical-expr-adapter = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-physical-expr-common = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-physical-plan = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-physical-optimizer = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-functions-window = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-functions = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-functions-nested = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-datasource = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-datasource-json = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }
+datafusion-datasource-parquet = { git = "https://github.com/apache/datafusion", rev = "a58dfc605a6fe00f5784e819ee83d820c2c6cc51" }

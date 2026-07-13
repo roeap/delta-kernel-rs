@@ -15,8 +15,8 @@ use datafusion_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::plans::ir::nodes::LoadNode;
 use delta_kernel::schema::SchemaRef;
+use delta_kernel::sm_plans::ir::nodes::LoadNode;
 use delta_kernel::Engine;
 
 use crate::exec::LoadExec;

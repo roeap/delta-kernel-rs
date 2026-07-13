@@ -1,5 +1,5 @@
 //! Round-trip integration tests for the SSA `compile_ssa` lowering. Each test builds a
-//! [`Plan`](delta_kernel::plans::ir::plan::Plan) via the SSA [`Context`] builder, wraps it in
+//! [`Plan`](delta_kernel::sm_plans::ir::plan::Plan) via the SSA [`Context`] builder, wraps it in
 //! a [`ResultPlan`], and runs it through [`DataFusionExecutor::ssa_result_to_dataframe`] --
 //! exercising the per-`NodeKind` lowerings without requiring a state machine.
 
@@ -15,11 +15,11 @@ use delta_kernel::arrow::datatypes::Int64Type;
 use delta_kernel::expressions::{
     ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar,
 };
-use delta_kernel::plans::ir::nodes::{ConsumeSink, FileType, ScanFileColumns};
-use delta_kernel::plans::ir::plan::ResultPlan;
-use delta_kernel::plans::state_machines::framework::plan_context::{Context, LoadSpec};
-use delta_kernel::plans::state_machines::framework::step::EngineRequest;
-use delta_kernel::plans::state_machines::framework::step_payload::EngineResponse;
+use delta_kernel::sm_plans::ir::nodes::{ConsumeSink, FileType, ScanFileColumns};
+use delta_kernel::sm_plans::ir::plan::ResultPlan;
+use delta_kernel::sm_plans::state_machines::framework::plan_context::{Context, LoadSpec};
+use delta_kernel::sm_plans::state_machines::framework::step::EngineRequest;
+use delta_kernel::sm_plans::state_machines::framework::step_payload::EngineResponse;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel_datafusion_engine::{testing, DataFusionExecutor};
 

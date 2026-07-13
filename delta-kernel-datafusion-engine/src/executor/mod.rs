@@ -5,7 +5,7 @@
 //! `EngineRequest::Consume` (SSA dataflow drained into a [`ConsumeSink`]). Terminal `ResultPlan`s
 //! describe a single self-contained dataflow DAG that compiles to a `LogicalPlan`.
 //!
-//! [`ConsumeSink`]: delta_kernel::plans::ir::nodes::ConsumeSink
+//! [`ConsumeSink`]: delta_kernel::sm_plans::ir::nodes::ConsumeSink
 
 use std::sync::Arc;
 
@@ -16,19 +16,21 @@ use datafusion_execution::config::SessionConfig;
 use datafusion_execution::TaskContext;
 use datafusion_physical_plan::ExecutionPlan;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::plans::errors::DeltaError;
-use delta_kernel::plans::ir::nodes::ConsumeSink;
-use delta_kernel::plans::kernel_consumers::{FinishedHandle, KdfControl};
-use delta_kernel::plans::state_machines::framework::coroutine::driver::CoroutineSM;
-use delta_kernel::plans::state_machines::framework::engine_error::{EngineError, EngineErrorKind};
-use delta_kernel::plans::state_machines::framework::state_machine::{NextStep, StateMachine};
-use delta_kernel::plans::state_machines::framework::step::{EngineRequest, SchemaQuery};
-use delta_kernel::plans::state_machines::framework::step_payload::EngineResponse;
-use delta_kernel::plans::state_machines::scan::FullState;
 use delta_kernel::scan::Scan;
+use delta_kernel::sm_plans::errors::DeltaError;
+use delta_kernel::sm_plans::ir::nodes::ConsumeSink;
+use delta_kernel::sm_plans::kernel_consumers::{FinishedHandle, KdfControl};
+use delta_kernel::sm_plans::state_machines::framework::coroutine::driver::CoroutineSM;
+use delta_kernel::sm_plans::state_machines::framework::engine_error::{
+    EngineError, EngineErrorKind,
+};
+use delta_kernel::sm_plans::state_machines::framework::state_machine::{NextStep, StateMachine};
+use delta_kernel::sm_plans::state_machines::framework::step::{EngineRequest, SchemaQuery};
+use delta_kernel::sm_plans::state_machines::framework::step_payload::EngineResponse;
+use delta_kernel::sm_plans::state_machines::scan::FullState;
 use delta_kernel::{Engine, Error as KernelError};
+use delta_kernel_default_engine::DefaultEngineBuilder;
 use futures::TryStreamExt;
 use url::Url;
 use uuid::Uuid;
@@ -99,6 +101,16 @@ impl DataFusionExecutor {
             .options_mut()
             .optimizer
             .enable_leaf_expression_pushdown = false;
+        // DF main dropped `ListingOptions::with_collect_stat`; statistics collection is now a
+        // session-level setting. Disable it -- kernel does its own file-level data skipping, and
+        // DF's parquet stats collector mis-handles column-mapping/field-id renamed columns (it
+        // stamps missing-by-logical-name columns as all-null, which the projection then folds to
+        // Literal::NULL before the field-id rename applies). See scan.rs for the full rationale.
+        session_config.options_mut().execution.collect_statistics = false;
+        // DF main also dropped `ListingOptions::with_target_partitions`; force single-partition
+        // execution at the session level. The consume-sink drain reads partition 0 only, and
+        // scan/FSR correctness does not depend on intra-file parallelism.
+        session_config.options_mut().execution.target_partitions = 1;
         let session_ctx = SessionContext::new_with_config(session_config);
         Ok(Self {
             task_ctx: Arc::new(TaskContext::default()),
@@ -126,13 +138,13 @@ impl DataFusionExecutor {
     /// # `!Send` future
     ///
     /// The kernel state machine is a CPU-only sequencer (see
-    /// [`delta_kernel::plans::state_machines::framework::coroutine::driver::CoroutineSM`] module
+    /// [`delta_kernel::sm_plans::state_machines::framework::coroutine::driver::CoroutineSM`] module
     /// docs); it intentionally does not implement `Send`. The future returned here
     /// inherits that and is therefore `!Send`. Callers needing a `Send` future drive this on a
     /// single-threaded runtime (`tokio::runtime::Builder::new_current_thread()` +
     /// `block_on`) or wrap the call in a [`tokio::task::LocalSet`].
     ///
-    /// [`ResultPlan`]: delta_kernel::plans::ir::plan::ResultPlan
+    /// [`ResultPlan`]: delta_kernel::sm_plans::ir::plan::ResultPlan
     pub async fn drive_to_completion<R: 'static>(
         &self,
         mut sm: CoroutineSM<R>,
@@ -159,10 +171,10 @@ impl DataFusionExecutor {
     /// [`DataFrame`]. SSA plans describe a single self-contained dataflow DAG; the compiled
     /// `LogicalPlan` is wrapped directly in a [`DataFrame`] for the caller.
     ///
-    /// [`ResultPlan`]: delta_kernel::plans::ir::plan::ResultPlan
+    /// [`ResultPlan`]: delta_kernel::sm_plans::ir::plan::ResultPlan
     pub async fn drive_ssa_to_dataframe(
         &self,
-        sm: CoroutineSM<delta_kernel::plans::ir::plan::ResultPlan>,
+        sm: CoroutineSM<delta_kernel::sm_plans::ir::plan::ResultPlan>,
     ) -> Result<DataFrame, DeltaError> {
         let rp = self.drive_to_completion(sm).await?;
         self.ssa_result_to_dataframe(&rp)
@@ -173,10 +185,10 @@ impl DataFusionExecutor {
     /// `CoroutineSM` wrapping that [`Self::drive_ssa_to_dataframe`] provides; also the
     /// canonical entry point for tests that construct SSA plans directly without an SM.
     ///
-    /// [`ResultPlan`]: delta_kernel::plans::ir::plan::ResultPlan
+    /// [`ResultPlan`]: delta_kernel::sm_plans::ir::plan::ResultPlan
     pub fn ssa_result_to_dataframe(
         &self,
-        rp: &delta_kernel::plans::ir::plan::ResultPlan,
+        rp: &delta_kernel::sm_plans::ir::plan::ResultPlan,
     ) -> Result<DataFrame, DeltaError> {
         let ctx = CompileContext {
             engine: Arc::clone(&self.engine),
@@ -248,8 +260,8 @@ impl DataFusionExecutor {
     /// the consume sink, and return the finalized handle.
     async fn run_consume(
         &self,
-        stmts: &[delta_kernel::plans::ir::plan::PlanNode],
-        terminal: delta_kernel::plans::ir::plan::Ref,
+        stmts: &[delta_kernel::sm_plans::ir::plan::PlanNode],
+        terminal: delta_kernel::sm_plans::ir::plan::Ref,
         sink: &ConsumeSink,
         sm_id: Uuid,
         sm_kind: &'static str,
@@ -270,7 +282,7 @@ impl DataFusionExecutor {
     }
 
     /// Drain `physical` through a
-    /// [`KernelConsumer`](delta_kernel::plans::kernel_consumers::KernelConsumer) handle
+    /// [`KernelConsumer`](delta_kernel::sm_plans::kernel_consumers::KernelConsumer) handle
     /// minted from `sink` and return the finalized handle.
     async fn drain_consume_sink(
         &self,

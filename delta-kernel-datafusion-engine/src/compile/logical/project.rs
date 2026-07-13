@@ -1,4 +1,4 @@
-//! Lowering for [`NodeKind::Project`](delta_kernel::plans::ir::plan::NodeKind::Project) plus the
+//! Lowering for [`NodeKind::Project`](delta_kernel::sm_plans::ir::plan::NodeKind::Project) plus the
 //! root-rename visitor that handles input/output name collisions.
 
 use std::borrow::Cow;
@@ -11,7 +11,8 @@ use datafusion_common::Column;
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{Expr, LogicalPlanBuilder};
 use delta_kernel::expressions::{ColumnName, Expression};
-use delta_kernel::plans::ir::nodes::ProjectNode;
+use delta_kernel::sm_plans::ir::nodes::ProjectNode;
+use delta_kernel::transform_output_type;
 use delta_kernel::transforms::ExpressionTransform;
 
 use crate::compile::expr_translator::{kernel_expr_to_df, TranslationContext};
@@ -34,6 +35,8 @@ struct TopLevelRootCollector {
 }
 
 impl<'a> ExpressionTransform<'a> for TopLevelRootCollector {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
         if let Some(first) = name.path().first() {
             self.roots.insert(first.to_string());
@@ -49,6 +52,8 @@ struct RewriteRootColumn<'a> {
 }
 
 impl<'a> ExpressionTransform<'a> for RewriteRootColumn<'_> {
+    transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
     fn transform_expr_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
         let path = name.path();
         if let Some(first) = path.first() {
@@ -66,9 +71,12 @@ impl<'a> ExpressionTransform<'a> for RewriteRootColumn<'_> {
 /// Apply `rewriter` to every expression in `exprs`, returning a fresh `Vec<Arc<Expression>>`
 /// where each entry is either the rewriter's owned output or a clone of the original (when
 /// the rewriter returned `None`).
-fn rewrite_expressions<'a, R: ExpressionTransform<'a>>(
-    exprs: &'a [Arc<Expression>],
-    rewriter: &mut R,
+// Concrete in `RewriteRootColumn` (not generic over `R: ExpressionTransform`) so that
+// `transform_expr`'s associated `Output<Expression>` resolves to `Option<Cow<Expression>>`,
+// which we can `.map(Cow::into_owned)`. A generic bound leaves `Output` opaque.
+fn rewrite_expressions(
+    exprs: &[Arc<Expression>],
+    rewriter: &mut RewriteRootColumn<'_>,
 ) -> Vec<Arc<Expression>> {
     exprs
         .iter()
@@ -83,7 +91,7 @@ fn rewrite_expressions<'a, R: ExpressionTransform<'a>>(
         .collect()
 }
 
-/// Lower a [`NodeKind::Project`](delta_kernel::plans::ir::plan::NodeKind::Project) arm to a
+/// Lower a [`NodeKind::Project`](delta_kernel::sm_plans::ir::plan::NodeKind::Project) arm to a
 /// DataFusion [`LogicalPlan`]. `child_plan` is the already-compiled child plan; this helper
 /// handles input/output name collision avoidance, pre-CSE hoisting, and the final projection
 /// expression construction.

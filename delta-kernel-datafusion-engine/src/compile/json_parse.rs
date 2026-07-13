@@ -44,6 +44,17 @@ fn generate_primitive_extract(
     prim: &PrimitiveType,
     path: &[String],
 ) -> Result<Expr, DataFusionError> {
+    // Types with no JSON-stats representation in this scaffold (added to kernel's PrimitiveType
+    // upstream). They never appear in data-skipping stats JSON, so reject rather than guess.
+    if matches!(
+        prim,
+        PrimitiveType::Void | PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime
+    ) {
+        return Err(crate::error::unsupported(format!(
+            "ParseJson extraction not supported for primitive type {prim:?}"
+        )));
+    }
+
     let mut args = vec![json_col.clone()];
     args.extend(path.iter().map(|p| lit(p.clone())));
 
@@ -59,7 +70,11 @@ fn generate_primitive_extract(
         | PrimitiveType::Timestamp
         | PrimitiveType::TimestampNtz
         | PrimitiveType::Binary
-        | PrimitiveType::Decimal(_) => json_get_str_udf(),
+        | PrimitiveType::Decimal(_)
+        // Rejected by the guard above; listed to keep the match exhaustive without panicking.
+        | PrimitiveType::Void
+        | PrimitiveType::IntervalYearMonth
+        | PrimitiveType::IntervalDayTime => json_get_str_udf(),
     };
 
     let extracted = Expr::ScalarFunction(ScalarFunction::new_udf(udf, args));
@@ -82,7 +97,11 @@ fn generate_primitive_extract(
         | PrimitiveType::Double
         | PrimitiveType::String
         | PrimitiveType::Boolean
-        | PrimitiveType::Binary => None,
+        | PrimitiveType::Binary
+        // Rejected by the guard above; listed to keep the match exhaustive without panicking.
+        | PrimitiveType::Void
+        | PrimitiveType::IntervalYearMonth
+        | PrimitiveType::IntervalDayTime => None,
     };
 
     match target_type {
