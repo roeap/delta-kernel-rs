@@ -21,6 +21,14 @@ use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluat
 pub mod evaluate_expression;
 pub mod opaque;
 
+/// Public re-export of the schema-application helpers for engine crates that build their own
+/// physical operators (e.g. the DataFusion engine's field-id adapter). The implementations live
+/// in `arrow_utils::apply_schema`; this module surfaces them at a stable engine-facing path.
+#[cfg(feature = "internal-api")]
+pub mod apply_schema {
+    pub use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
+}
+
 #[cfg(test)]
 mod tests;
 

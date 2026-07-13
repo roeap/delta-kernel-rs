@@ -176,8 +176,11 @@ declarative-plans = ["internal-api", "dep:prost", "dep:prost-build", "dep:protoc
 # Enables:
 #   - `internal-api` -- the SSA IR uses kernel-internal types (most notably
 #     `schema::ToSchema`) hidden under `#[internal_api]`.
-#   - `arrow` -- KDF consumer impls return Arrow-typed views over each batch.
-sm-plans = ["internal-api", "arrow", "dep:dyn-clone", "dep:genawaiter2"]
+#   - `need-arrow` -- KDF consumer impls return Arrow-typed views over each batch. Uses the
+#     `need-arrow` marker (not the `arrow`-latest alias) so a consumer can pair `sm-plans` with an
+#     explicit arrow major without the latest being forced. Consumers must select an arrow major
+#     (e.g. `arrow-59`) alongside `sm-plans`, same as `arrow-conversion` / `arrow-expression`.
+sm-plans = ["internal-api", "need-arrow", "dep:dyn-clone", "dep:genawaiter2"]
 
 # Experimental, temporary, test-only feature flag guarding the in-progress column-defaults
 # work. TODO(#2630): remove once full column-defaults support ships.
