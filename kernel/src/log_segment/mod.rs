@@ -194,6 +194,32 @@ impl LogSegment {
         })
     }
 
+    /// Constructs a [`LogSegment`] from an already-discovered set of log files, **without any
+    /// filesystem listing**.
+    ///
+    /// This is the list-free entry point mirroring [`Self::for_snapshot`], for engines that
+    /// discover the `_delta_log` file set out-of-band — e.g. a catalog manifest, or HEAD-probing
+    /// over plain HTTP where no directory listing exists (the wasm preview path). The caller
+    /// supplies the log root, the parsed log paths (commits + checkpoint parts, in any order),
+    /// and the pinned end version; grouping, checkpoint-completeness, and validation are identical
+    /// to the listing path because both funnel through
+    /// [`LogSegmentFiles::from_parsed_paths`](crate::log_segment_files::LogSegmentFiles::from_parsed_paths)
+    /// and [`Self::try_new`].
+    ///
+    /// No `_last_checkpoint` hint is consulted (the manifest already names the checkpoint, if any),
+    /// so `last_checkpoint_metadata` is `None`. This means the resulting segment carries no
+    /// checkpoint-hint sidecar/stats schema; callers that need those must supply the hint via
+    /// [`Self::try_new`] directly.
+    #[internal_api]
+    pub(crate) fn from_listed_files(
+        log_root: Url,
+        paths: Vec<ParsedLogPath>,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        let listed = LogSegmentFiles::from_parsed_paths(paths, end_version)?;
+        Self::try_new(listed, log_root, end_version, None)
+    }
+
     #[internal_api]
     pub(crate) fn try_new(
         mut listed_files: LogSegmentFiles,

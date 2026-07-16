@@ -332,6 +332,45 @@ impl ListingAccumulator {
 const BACKWARD_SCAN_WINDOW_SIZE: u64 = 1000;
 
 impl LogSegmentFiles {
+    /// Assembles a `LogSegmentFiles` from a caller-supplied set of already-discovered
+    /// log paths, **without any filesystem listing**.
+    ///
+    /// This is the list-free counterpart to [`Self::list`]: engines that discover the log
+    /// file set out-of-band (e.g. a catalog manifest, or HEAD-probing over plain HTTP where
+    /// no directory listing exists) hand the paths in here and get the same grouping,
+    /// checkpoint-completeness, and `latest_commit_file`/`max_published_version` semantics as
+    /// a storage listing would produce.
+    ///
+    /// `paths` may be in any order and may mix commits, checkpoint parts, compaction, and CRC
+    /// files; they are sorted by version ascending (stable, so multi-part checkpoint parts keep
+    /// their relative order within a version) and routed through the same
+    /// [`Self::build_log_segment_files`] accumulator the listing path uses. `end_version`
+    /// bounds the result as in the listing path (`None` = no bound).
+    ///
+    /// The caller still passes the result to [`LogSegment::try_new`], which performs the full
+    /// contiguity / checkpoint-gap / end-version validation.
+    ///
+    /// [`LogSegment::try_new`]: crate::log_segment::LogSegment::try_new
+    #[internal_api]
+    pub(crate) fn from_parsed_paths(
+        mut paths: Vec<ParsedLogPath>,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        // `build_log_segment_files` requires ascending version order (the checkpoint grouping
+        // accumulator flushes a group when the version changes). Sort stably so that multi-part
+        // checkpoint parts at the same version keep their discovered order.
+        paths.sort_by_key(|p| p.version);
+        let start_version = paths.first().map(|p| p.version).unwrap_or(0);
+        // Everything comes in as `fs_files`; there is no separate catalog `log_tail` here (any
+        // catalog commits are already merged into `paths` by the caller).
+        Self::build_log_segment_files(
+            paths.into_iter().map(Ok),
+            Vec::new(),
+            start_version,
+            end_version,
+        )
+    }
+
     /// Assembles a `LogSegmentFiles` from `fs_files` (an iterator of files
     /// listed from storage) and `log_tail` (catalog-provided commits).
     ///

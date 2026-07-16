@@ -179,6 +179,29 @@ impl Snapshot {
         })
     }
 
+    /// Assemble a [`Snapshot`] from an already-resolved [`LogSegment`] and Protocol + Metadata,
+    /// **engine-free** and with **no CRC**.
+    ///
+    /// This is the list-free / replay-free counterpart to [`Self::try_new_from_log_segment`]: the
+    /// caller has resolved Protocol and Metadata by some other means (e.g. driving the `sm_plans`
+    /// P&M state machine over the log through an async engine), so this just builds the
+    /// [`TableConfiguration`] and wraps it — no `&dyn Engine`, no log read, no CRC fast-path.
+    ///
+    /// The snapshot's version is the log segment's `end_version`. Because no CRC is carried,
+    /// downstream operations that would consult a precomputed CRC simply fall back to replay; this
+    /// is intentional for read-only preview construction where always-replay is correct.
+    #[internal_api]
+    pub(crate) fn from_parts(
+        location: Url,
+        log_segment: LogSegment,
+        protocol: Protocol,
+        metadata: Metadata,
+    ) -> DeltaResult<Self> {
+        let table_configuration =
+            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
+        Self::new_with_crc(log_segment, table_configuration, None)
+    }
+
     /// Create a new [`Snapshot`] from a freshly-listed [`LogSegment`]. Takes Protocol and Metadata
     /// from the latest on-disk CRC, advanced to the segment's end version when `incremental_replay`
     /// permits, or used to root Protocol and Metadata log replay otherwise. Falls back to full log

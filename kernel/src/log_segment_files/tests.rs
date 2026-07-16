@@ -1337,3 +1337,60 @@ fn find_complete_checkpoint_version_cases(
 ) {
     assert_eq!(find_complete_checkpoint_version(&files), expected);
 }
+
+// === M0: list-free construction (`from_parsed_paths`) matches storage listing ===========
+
+/// Collect the parsed log paths a storage listing would yield over `[0, end]`, so a
+/// list-free `from_parsed_paths` can be fed exactly what `list` saw.
+fn parsed_paths_from_storage(
+    storage: &dyn StorageHandler,
+    log_root: &Url,
+    end: Version,
+) -> Vec<ParsedLogPath> {
+    list_from_storage(storage, log_root, 0, end)
+        .unwrap()
+        .map(|r| r.unwrap())
+        .filter(|p| p.should_list())
+        .collect()
+}
+
+#[rstest]
+// Commit-only log v0..=3.
+#[case::commit_only(
+    (0u64..=3).map(|v| (v, LogPathFileType::Commit, CommitSource::Filesystem)).collect::<Vec<_>>(),
+    3u64
+)]
+// Classic single-part checkpoint at v2, commits through v4.
+#[case::classic_checkpoint(
+    vec![
+        (0, LogPathFileType::Commit, CommitSource::Filesystem),
+        (1, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::Commit, CommitSource::Filesystem),
+        (2, LogPathFileType::SinglePartCheckpoint, CommitSource::Filesystem),
+        (3, LogPathFileType::Commit, CommitSource::Filesystem),
+        (4, LogPathFileType::Commit, CommitSource::Filesystem),
+    ],
+    4u64
+)]
+#[tokio::test]
+async fn from_parsed_paths_matches_listing(
+    #[case] log_files: Vec<(Version, LogPathFileType, CommitSource)>,
+    #[case] end: Version,
+) {
+    let (storage, log_root) = create_storage(log_files).await;
+
+    // Eager path: storage listing.
+    let listed =
+        LogSegmentFiles::list(storage.as_ref(), &log_root, vec![], Some(0), Some(end)).unwrap();
+
+    // List-free path: hand `from_parsed_paths` the same files (order-independent).
+    let mut paths = parsed_paths_from_storage(storage.as_ref(), &log_root, end);
+    // Prove order-independence by reversing before feeding it in.
+    paths.reverse();
+    let built = LogSegmentFiles::from_parsed_paths(paths, Some(end)).unwrap();
+
+    assert_eq!(
+        built, listed,
+        "list-free from_parsed_paths must produce the same LogSegmentFiles as storage listing"
+    );
+}
