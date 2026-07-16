@@ -87,7 +87,7 @@ impl FullState {
                 stats,
                 /* parts= */ None,
                 Arc::new(fsr_dedup_key()),
-                retention_timestamps(snapshot.as_ref())?,
+                Some(retention_timestamps(snapshot.as_ref())?),
             )
             .await?;
             ctx.into_result_plan(reconciled)

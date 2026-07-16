@@ -45,8 +45,8 @@ impl SnapshotPm {
     /// Build the coroutine SM that drives P&M resolution end-to-end, yielding the effective
     /// `(Protocol, Metadata)`.
     ///
-    /// The SM builds the shared reconciliation pipeline over [`PM_BASE`] (retention is a no-op —
-    /// the base carries no tombstone/txn rows — so it passes `(0, None)`) and drains the reconciled
+    /// The SM builds the shared reconciliation pipeline over [`PM_BASE`] (retention is skipped —
+    /// the base carries no tombstone/txn rows — so it passes `None`) and drains the reconciled
     /// stream through a [`MetadataProtocolReader`], which captures the newest Protocol and Metadata
     /// (`max_by_version` already collapses each singleton to its winning row) and stops as soon as
     /// both are present.
@@ -62,7 +62,7 @@ impl SnapshotPm {
                 /* stats= */ None,
                 /* parts= */ None,
                 Arc::new(pm_dedup_key()),
-                /* retention= */ (0, None),
+                /* retention= */ None,
             )
             .await?;
             ctx.consume(

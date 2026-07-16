@@ -86,7 +86,8 @@ pub(super) static FSR_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// singleton table-state actions a snapshot needs to build its [`TableConfiguration`]. It
 /// mirrors the projection the eager replay uses (`read_pm_batches` reads exactly
 /// `{PROTOCOL_FIELD, METADATA_FIELD}`). Because it carries neither `remove` nor `txn` rows,
-/// the reconciliation's retention filter is a no-op (callers pass `(0, None)`).
+/// callers pass `retention = None` to skip the retention filter entirely (it would otherwise
+/// reference the absent `remove`/`txn` columns).
 pub(crate) static PM_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
     arc_schema([
         StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
@@ -445,7 +446,7 @@ pub(super) fn build_reconciliation_ssa(
     shape: &SsaScanShape,
     base: &SchemaRef,
     dedup_key: ExpressionRef,
-    retention: (i64, Option<i64>),
+    retention: Option<(i64, Option<i64>)>,
 ) -> Result<PlanBuilder, DeltaError> {
     let stats = shape.stats.as_ref().map(|s| &s.schema);
     let parts = shape.partition_schema.as_ref();
@@ -453,7 +454,6 @@ pub(super) fn build_reconciliation_ssa(
 
     let commits = commit_cover_rows(log_segment)?;
     let log_root = log_segment.log_root.clone();
-    let (min_file_ts, txn_expiry) = retention;
 
     // === Stage 1: commit_load ===========================================================
     // VALUES(commits) -> Load(JSON) broadcasts the per-commit `version` column onto every
@@ -566,25 +566,46 @@ pub(super) fn build_reconciliation_ssa(
     };
 
     // === Stage 5b: antijoin + union + retention -> reconciled ===========================
-    let terminal_input = if let Some(view) = checkpoint_view {
-        let keyed = view
+    let terminal_input = match checkpoint_view {
+        // No checkpoint: commit replay is the whole state.
+        None => commit_dedup,
+        // Checkpoint but no commits cover the segment (e.g. a checkpoint at the snapshot version
+        // with nothing after it): the checkpoint IS the complete state. Filter to identity rows
+        // and append the join key so the terminal schema matches, but skip both the anti-join and
+        // the commit union — a `LeftAnti` against an empty `commit_dedup` build side
+        // (`CollectLeft`) emits zero rows, which would drop the entire checkpoint. No
+        // `max_by_version` is needed: a checkpoint is already reconciled (one row per key). This
+        // applies to any base and is what makes P&M resolution of a checkpoint-only table work.
+        Some(view) if commits.is_empty() => view
             .filter(identity_not_null)?
-            .append_col_typed(JOIN_KEY_FIELD.clone(), Arc::clone(&dedup_key))?;
-        // `NodeKind::EquiJoin(EquiJoinNode { kind: LeftAnti, .. })` produces left-schema output
-        // regardless of the right side's shape. Pass `commit_dedup` as-is and let the
-        // engine's projection pushdown prune unused right-side columns.
-        let survivors = keyed.left_anti_join(
-            commit_dedup.clone(),
-            [(col(FSR_JOIN_KEY_COL), col(FSR_JOIN_KEY_COL))],
-        )?;
-        commit_dedup.union_all(&[survivors])?
-    } else {
-        commit_dedup
+            .append_col_typed(JOIN_KEY_FIELD.clone(), Arc::clone(&dedup_key))?,
+        // Checkpoint + commits: anti-join the checkpoint against the deduped commits (commits
+        // win), then union.
+        Some(view) => {
+            let keyed = view
+                .filter(identity_not_null)?
+                .append_col_typed(JOIN_KEY_FIELD.clone(), Arc::clone(&dedup_key))?;
+            // `NodeKind::EquiJoin(EquiJoinNode { kind: LeftAnti, .. })` produces left-schema output
+            // regardless of the right side's shape. Pass `commit_dedup` as-is and let the
+            // engine's projection pushdown prune unused right-side columns.
+            let survivors = keyed.left_anti_join(
+                commit_dedup.clone(),
+                [(col(FSR_JOIN_KEY_COL), col(FSR_JOIN_KEY_COL))],
+            )?;
+            commit_dedup.union_all(&[survivors])?
+        }
     };
 
-    terminal_input
-        .filter(retention_filter(min_file_ts, txn_expiry))?
-        .drop_col(FSR_JOIN_KEY_COL)
+    // Retention filtering references `remove`/`txn` columns; a base that lacks them (e.g. the
+    // P&M base) passes `None` to skip the filter entirely rather than emit a predicate over
+    // absent columns.
+    let filtered = match retention {
+        Some((min_file_ts, txn_expiry)) => {
+            terminal_input.filter(retention_filter(min_file_ts, txn_expiry))?
+        }
+        None => terminal_input,
+    };
+    filtered.drop_col(FSR_JOIN_KEY_COL)
 }
 
 /// Async wrapper: resolve the scan shape (yielding `SchemaQuery` / `Consume` phases as
@@ -598,7 +619,7 @@ pub(crate) async fn execute_reconciliation_ssa(
     stats: Option<SchemaRef>,
     parts: Option<SchemaRef>,
     dedup_key: ExpressionRef,
-    retention: (i64, Option<i64>),
+    retention: Option<(i64, Option<i64>)>,
 ) -> Result<PlanBuilder, DeltaError> {
     let shape = resolve_shape_ssa(ctx, engine, log_segment, stats.as_ref(), parts).await?;
     build_reconciliation_ssa(ctx, log_segment, &shape, base, dedup_key, retention)

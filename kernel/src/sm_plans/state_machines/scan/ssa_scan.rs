@@ -66,7 +66,7 @@ pub(super) async fn build_scan_ssa(
         stats,
         parts.clone(),
         Arc::new(scan_file_dedup_key()),
-        retention_timestamps(snapshot)?,
+        Some(retention_timestamps(snapshot)?),
     )
     .await?;
 
