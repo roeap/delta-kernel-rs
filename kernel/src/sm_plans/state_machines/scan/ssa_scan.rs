@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use super::file_scan::scan_data_projection;
-use super::ssa_reconciliation::{execute_reconciliation_ssa, scan_file_dedup_key, SCAN_BASE};
+use super::ssa_reconciliation::{
+    execute_reconciliation_ssa, retention_timestamps, scan_file_dedup_key, SCAN_BASE,
+};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::ADD_NAME;
 use crate::expressions::{col, ColumnName, Expression};
@@ -55,14 +57,16 @@ pub(super) async fn build_scan_ssa(
     };
 
     // === Stages 1-5: shared reconciliation -> reconciled builder =========================
+    let snapshot = scan.snapshot().as_ref();
     let reconciled = execute_reconciliation_ssa(
         ctx,
         engine,
-        scan.snapshot().as_ref(),
+        snapshot.log_segment(),
         &SCAN_BASE,
         stats,
         parts.clone(),
         Arc::new(scan_file_dedup_key()),
+        retention_timestamps(snapshot)?,
     )
     .await?;
 

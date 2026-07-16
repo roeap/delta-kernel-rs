@@ -80,6 +80,20 @@ pub(super) static FSR_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
     ])
 });
 
+/// Protocol & Metadata pipeline base: only the `{protocol, metaData}` slots.
+///
+/// This is the base for snapshot-construction (P&M resolution) reconciliation — the two
+/// singleton table-state actions a snapshot needs to build its [`TableConfiguration`]. It
+/// mirrors the projection the eager replay uses (`read_pm_batches` reads exactly
+/// `{PROTOCOL_FIELD, METADATA_FIELD}`). Because it carries neither `remove` nor `txn` rows,
+/// the reconciliation's retention filter is a no-op (callers pass `(0, None)`).
+pub(crate) static PM_BASE: LazyLock<SchemaRef> = LazyLock::new(|| {
+    arc_schema([
+        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+    ])
+});
+
 // ============================================================================
 // Synthetic dedup-key column (name + typed field)
 // ============================================================================
@@ -200,6 +214,33 @@ pub(super) fn scan_file_dedup_key() -> Expression {
     Expression::case_when(vec![(is_file_row(), file_arm())], null_string_array())
 }
 
+/// P&M-pipeline dedup key: identity over the two singleton `{protocol, metaData}` slots.
+///
+/// The `protocol` and `metadata` arms are byte-for-byte the same arms
+/// [`fsr_dedup_key`] uses (both are singletons — a constant per-kind key, so `max_by_version`
+/// keeps only the newest of each). File / domainMetadata / txn arms are omitted because the
+/// P&M base never carries those rows. Evaluates to NULL on non-P&M rows, so
+/// `dedup_key IS NOT NULL` is the identity filter.
+pub(crate) fn pm_dedup_key() -> Expression {
+    let null_str = || Expression::literal(Scalar::Null(DataType::STRING));
+    let arm = |kind: &str| {
+        Expression::array(vec![
+            Expression::literal(kind),
+            null_str(),
+            null_str(),
+            null_str(),
+        ])
+    };
+    Expression::case_when(
+        vec![
+            (col(["protocol"]).is_not_null(), arm(PROTOCOL_NAME)),
+            // Metadata is a singleton table-state action: latest row wins regardless of prior id.
+            (col(METADATA_ID).is_not_null(), arm("metadata")),
+        ],
+        null_string_array(),
+    )
+}
+
 // ============================================================================
 // Tombstone / txn-expiration retention predicate
 // ============================================================================
@@ -298,11 +339,11 @@ pub(super) enum CheckpointStatsLayout {
 pub(super) async fn resolve_shape_ssa(
     ctx: &Context,
     engine: &mut Engine,
-    snapshot: &Snapshot,
+    log_segment: &LogSegment,
     stats_schema: Option<&SchemaRef>,
     partition_schema: Option<SchemaRef>,
 ) -> Result<SsaScanShape, DeltaError> {
-    let seg = snapshot.log_segment();
+    let seg = log_segment;
     let checkpoint_parts = &seg.listed.checkpoint_parts;
 
     let make_info = |checkpoint, has_parsed_stats| SsaScanShape {
@@ -363,7 +404,7 @@ pub(super) async fn resolve_shape_ssa(
         .consume(
             engine,
             sidecar_chain,
-            SidecarCollector::new(snapshot.log_segment().log_root.clone()),
+            SidecarCollector::new(log_segment.log_root.clone()),
             "ScanShapeInfoSsa::resolve::sidecar_extract",
         )
         .await?;
@@ -400,18 +441,19 @@ pub(super) async fn resolve_shape_ssa(
 /// [`Context::into_result_plan`].
 pub(super) fn build_reconciliation_ssa(
     ctx: &Context,
-    snapshot: &Snapshot,
+    log_segment: &LogSegment,
     shape: &SsaScanShape,
     base: &SchemaRef,
     dedup_key: ExpressionRef,
+    retention: (i64, Option<i64>),
 ) -> Result<PlanBuilder, DeltaError> {
     let stats = shape.stats.as_ref().map(|s| &s.schema);
     let parts = shape.partition_schema.as_ref();
     let identity_not_null: PredicateRef = Arc::new(dedup_key.as_ref().clone().is_not_null());
 
-    let commits = commit_cover_rows(snapshot.log_segment())?;
-    let log_root = snapshot.log_segment().log_root.clone();
-    let (min_file_ts, txn_expiry) = retention_timestamps(snapshot)?;
+    let commits = commit_cover_rows(log_segment)?;
+    let log_root = log_segment.log_root.clone();
+    let (min_file_ts, txn_expiry) = retention;
 
     // === Stage 1: commit_load ===========================================================
     // VALUES(commits) -> Load(JSON) broadcasts the per-commit `version` column onto every
@@ -547,17 +589,19 @@ pub(super) fn build_reconciliation_ssa(
 
 /// Async wrapper: resolve the scan shape (yielding `SchemaQuery` / `Consume` phases as
 /// needed) and then delegate to [`build_reconciliation_ssa`].
-pub(super) async fn execute_reconciliation_ssa(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_reconciliation_ssa(
     ctx: &Context,
     engine: &mut Engine,
-    snapshot: &Snapshot,
+    log_segment: &LogSegment,
     base: &SchemaRef,
     stats: Option<SchemaRef>,
     parts: Option<SchemaRef>,
     dedup_key: ExpressionRef,
+    retention: (i64, Option<i64>),
 ) -> Result<PlanBuilder, DeltaError> {
-    let shape = resolve_shape_ssa(ctx, engine, snapshot, stats.as_ref(), parts).await?;
-    build_reconciliation_ssa(ctx, snapshot, &shape, base, dedup_key)
+    let shape = resolve_shape_ssa(ctx, engine, log_segment, stats.as_ref(), parts).await?;
+    build_reconciliation_ssa(ctx, log_segment, &shape, base, dedup_key, retention)
 }
 
 /// Helper: scan an inline checkpoint and align it to the expected post-checkpoint shape.
@@ -730,7 +774,7 @@ pub struct CommitFileMeta {
 }
 
 /// Resolve the (deleted-file retention, txn expiry) timestamps for `snapshot`.
-fn retention_timestamps(snapshot: &Snapshot) -> Result<(i64, Option<i64>), DeltaError> {
+pub(super) fn retention_timestamps(snapshot: &Snapshot) -> Result<(i64, Option<i64>), DeltaError> {
     let now = current_time_duration().map_err(|e| e.into_delta_default())?;
     let min_file_ts = deleted_file_retention_timestamp_with_time(
         snapshot.table_properties().deleted_file_retention_duration,

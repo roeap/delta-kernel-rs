@@ -25,7 +25,9 @@
 
 use std::sync::Arc;
 
-use super::ssa_reconciliation::{execute_reconciliation_ssa, fsr_dedup_key, FSR_BASE};
+use super::ssa_reconciliation::{
+    execute_reconciliation_ssa, fsr_dedup_key, retention_timestamps, FSR_BASE,
+};
 use crate::scan::state_info::StateInfo;
 use crate::scan::{PartitionValuesOptions, StatsOptions};
 use crate::sm_plans::errors::{DeltaError, KernelErrAsDelta};
@@ -80,11 +82,12 @@ impl FullState {
             let reconciled = execute_reconciliation_ssa(
                 &ctx,
                 &mut engine,
-                snapshot.as_ref(),
+                snapshot.log_segment(),
                 &FSR_BASE,
                 stats,
                 /* parts= */ None,
                 Arc::new(fsr_dedup_key()),
+                retention_timestamps(snapshot.as_ref())?,
             )
             .await?;
             ctx.into_result_plan(reconciled)
