@@ -32,10 +32,46 @@ impl Scan {
         let scan = self.clone();
         CoroutineSM::new("scan_metadata_ssa", move |mut engine, _sm_id| async move {
             let ctx = SsaContext::new();
-            let live_actions =
-                build_scan_ssa(&ctx, &mut engine, &scan, /* with_data= */ false).await?;
+            let live_actions = build_scan_ssa(
+                &ctx,
+                &mut engine,
+                &scan,
+                /* with_data= */ false,
+                /* with_stats= */ false,
+            )
+            .await?;
             ctx.into_result_plan(live_actions)
         })
+    }
+
+    /// CoroutineSM SM for metadata-only scan execution that **retains per-file stats**.
+    ///
+    /// Identical to [`Self::scan_metadata_state_machine`] except the flat `scan_file_row`
+    /// terminal appends a top-level `stats: STRUCT<physical_stats_schema>?` column (carrying the
+    /// reconciled `add.stats_parsed`) so an engine-free consumer can collect a `path -> stats`
+    /// map on the same SSA driver.
+    ///
+    /// The `stats` column only appears when the scan was built requesting struct stats
+    /// (`ScanBuilder::with_stats(StatsOptions::all_struct())` — there is no `Scan`-level
+    /// shortcut). Otherwise `physical_stats_schema()` is `None` and this is a no-op: no extra
+    /// stats I/O, and the terminal is byte-identical to [`Self::scan_metadata_state_machine`].
+    pub fn scan_stats_metadata_state_machine(&self) -> Result<CoroutineSM<ResultPlan>, DeltaError> {
+        let scan = self.clone();
+        CoroutineSM::new(
+            "scan_stats_metadata_ssa",
+            move |mut engine, _sm_id| async move {
+                let ctx = SsaContext::new();
+                let live_actions = build_scan_ssa(
+                    &ctx,
+                    &mut engine,
+                    &scan,
+                    /* with_data= */ false,
+                    /* with_stats= */ true,
+                )
+                .await?;
+                ctx.into_result_plan(live_actions)
+            },
+        )
     }
 
     /// CoroutineSM SM for combined metadata + data scan execution.
@@ -47,7 +83,14 @@ impl Scan {
         let scan = self.clone();
         CoroutineSM::new("scan_ssa", move |mut engine, _sm_id| async move {
             let ctx = SsaContext::new();
-            let data = build_scan_ssa(&ctx, &mut engine, &scan, /* with_data= */ true).await?;
+            let data = build_scan_ssa(
+                &ctx,
+                &mut engine,
+                &scan,
+                /* with_data= */ true,
+                /* with_stats= */ false,
+            )
+            .await?;
             ctx.into_result_plan(data)
         })
     }

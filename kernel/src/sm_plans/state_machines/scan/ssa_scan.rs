@@ -45,8 +45,15 @@ pub(super) async fn build_scan_ssa(
     engine: &mut Engine,
     scan: &Scan,
     with_data: bool,
+    with_stats: bool,
 ) -> Result<PlanBuilder, DeltaError> {
     let stats = scan.physical_stats_schema();
+    // When `with_stats`, the flat terminal retains `add.stats_parsed` as a top-level `stats`
+    // column (see `project_scan_file_row`). Capture the schema here: `stats` is *moved* into
+    // `execute_reconciliation_ssa` below, so the terminal needs its own copy. `None` when stats
+    // were not requested (`physical_stats_schema()` is `None`), which keeps the terminal
+    // byte-identical to the plain metadata SM.
+    let terminal_stats = if with_stats { stats.clone() } else { None };
     // The data stage needs the full partition schema (see `data_stage_partition_schema`
     // doc on [`Scan`]); the predicate-narrowed `physical_partition_schema()` only works
     // for metadata-only execution.
@@ -71,7 +78,7 @@ pub(super) async fn build_scan_ssa(
     .await?;
 
     // === Scan-specific terminal projection: reconciled -> flat scan_file_row ==========
-    let live_actions = project_scan_file_row(reconciled, parts.as_ref())?;
+    let live_actions = project_scan_file_row(reconciled, parts.as_ref(), terminal_stats.as_ref())?;
 
     // === Stage 6 (optional): data phase =================================================
     if with_data {
@@ -133,8 +140,16 @@ fn do_data_stage_ssa(scan: &Scan, live_actions: PlanBuilder) -> Result<PlanBuild
 ///     clusteringProvider: STRING?,
 ///     partitionValues_parsed?: STRUCT<...>,  // present iff `partitions` is Some
 ///   >?,
+///   stats?: STRUCT<...>,  // present iff `physical_stats_schema` is Some (retains add.stats_parsed)
 /// }
 /// ```
+///
+/// **Stats:** when `physical_stats_schema` is `Some`, a top-level `stats` column (a *sibling* of
+/// `fileConstantValues`, not nested) is appended, carrying the reconciled `add.stats_parsed`
+/// struct verbatim (physical leaf names). It is `None` unless the scan was built requesting struct
+/// stats (`StatsOptions::all_struct()` / `struct_columns`), in which case the terminal is
+/// byte-identical to the four-field shape. The metadata-only SM
+/// (`scan_stats_metadata_state_machine`) passes it through; the data-stage SMs pass `None`.
 ///
 /// **Invariant:** when `partitions` is `Some(parts)`, the upstream reconciliation pipeline
 /// must have already replaced `add.partitionValues` with `add.partitionValues_parsed`
@@ -146,6 +161,7 @@ fn do_data_stage_ssa(scan: &Scan, live_actions: PlanBuilder) -> Result<PlanBuild
 fn project_scan_file_row(
     builder: PlanBuilder,
     partitions: Option<&SchemaRef>,
+    physical_stats_schema: Option<&SchemaRef>,
 ) -> Result<PlanBuilder, DeltaError> {
     let tags = MapType::new(DataType::STRING, DataType::STRING, true);
     let mut file_constant_fields = vec![
@@ -168,7 +184,7 @@ fn project_scan_file_row(
         file_constant_exprs.push(col([ADD_NAME, "partitionValues_parsed"]).into());
     }
 
-    let schema = Arc::new(StructType::new_unchecked([
+    let mut top_fields = vec![
         StructField::not_null("path", DataType::STRING),
         StructField::not_null("size", DataType::LONG),
         StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
@@ -176,13 +192,26 @@ fn project_scan_file_row(
             FILE_CONSTANT_VALUES_NAME,
             StructType::new_unchecked(file_constant_fields),
         ),
-    ]));
-    let exprs: Vec<Arc<Expression>> = vec![
+    ];
+    let mut exprs: Vec<Arc<Expression>> = vec![
         col([ADD_NAME, "path"]).into(),
         col([ADD_NAME, "size"]).into(),
         col([ADD_NAME, "deletionVector"]).into(),
         Arc::new(Expression::struct_from(file_constant_exprs)),
     ];
+    // Stage K: retain per-file stats as a top-level `stats` column (sibling of
+    // `fileConstantValues`) so an engine-free consumer can read `add.stats_parsed` off the flat
+    // scan_file_row. The struct shape is `physical_stats_schema` verbatim (physical leaf names).
+    // Appended in lockstep with `top_fields` so `project_with_schema`'s field/expr counts match.
+    if let Some(stats_schema) = physical_stats_schema {
+        top_fields.push(StructField::nullable(
+            "stats",
+            stats_schema.as_ref().clone(),
+        ));
+        exprs.push(col([ADD_NAME, "stats_parsed"]).into());
+    }
+
+    let schema = Arc::new(StructType::new_unchecked(top_fields));
     builder.project_with_schema(exprs, schema)
 }
 
@@ -201,6 +230,16 @@ mod tests {
     /// terminal projection reads only those field names regardless of how the rest of the
     /// upstream looks.
     fn make_input_builder(parts: Option<&SchemaRef>) -> (Context, PlanBuilder) {
+        make_input_builder_with_stats(parts, None)
+    }
+
+    /// Like [`make_input_builder`] but optionally stamps an `add.stats_parsed` struct field on the
+    /// synthetic reconciled `add` slot, so the terminal's `col([ADD_NAME, "stats_parsed"])`
+    /// reference resolves when exercising the stats-retention path.
+    fn make_input_builder_with_stats(
+        parts: Option<&SchemaRef>,
+        stats: Option<&SchemaRef>,
+    ) -> (Context, PlanBuilder) {
         let tags = MapType::new(DataType::STRING, DataType::STRING, true);
         let mut add_fields = vec![
             StructField::nullable("path", DataType::STRING),
@@ -216,6 +255,9 @@ mod tests {
                 "partitionValues_parsed",
                 p.as_ref().clone(),
             ));
+        }
+        if let Some(s) = stats {
+            add_fields.push(StructField::nullable("stats_parsed", s.as_ref().clone()));
         }
         let schema = arc_schema([
             StructField::nullable(ADD_NAME, StructType::new_unchecked(add_fields)),
@@ -233,7 +275,7 @@ mod tests {
     #[test]
     fn project_scan_file_row_drops_partition_values_map_when_no_parts() {
         let (_ctx, builder) = make_input_builder(None);
-        let out = project_scan_file_row(builder, None).unwrap();
+        let out = project_scan_file_row(builder, None, None).unwrap();
         let schema = out.schema().unwrap();
         let fields: Vec<_> = schema.fields().map(|f| f.name().clone()).collect();
         assert_eq!(
@@ -263,7 +305,7 @@ mod tests {
     fn project_scan_file_row_appends_partitions_parsed_when_some() {
         let parts = arc_schema([StructField::nullable("p", DataType::STRING)]);
         let (_ctx, builder) = make_input_builder(Some(&parts));
-        let out = project_scan_file_row(builder, Some(&parts)).unwrap();
+        let out = project_scan_file_row(builder, Some(&parts), None).unwrap();
         let schema = out.schema().unwrap();
         let DataType::Struct(fcv) = schema.field(FILE_CONSTANT_VALUES_NAME).unwrap().data_type()
         else {
@@ -280,6 +322,63 @@ mod tests {
                 "partitionValues_parsed",
             ],
             "partitions present => partitionValues_parsed appended; Map slot stays absent",
+        );
+    }
+
+    /// With `physical_stats_schema` = `Some`: a top-level `stats` column (sibling of
+    /// `fileConstantValues`, carrying `add.stats_parsed`) is appended; passing `None` leaves the
+    /// terminal byte-identical to the four-field shape.
+    #[test]
+    fn project_scan_file_row_appends_stats_when_requested() {
+        let stats = arc_schema([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable(
+                "minValues",
+                StructType::new_unchecked([StructField::nullable("col-abc", DataType::LONG)]),
+            ),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
+
+        // stats requested => `stats` appended as a top-level sibling of `fileConstantValues`.
+        let (_ctx, builder) = make_input_builder_with_stats(None, Some(&stats));
+        let out = project_scan_file_row(builder, None, Some(&stats)).unwrap();
+        let schema = out.schema().unwrap();
+        let fields: Vec<_> = schema.fields().map(|f| f.name().clone()).collect();
+        assert_eq!(
+            fields,
+            [
+                "path",
+                "size",
+                "deletionVector",
+                FILE_CONSTANT_VALUES_NAME,
+                "stats"
+            ],
+            "stats requested => top-level `stats` column appended after fileConstantValues",
+        );
+        let DataType::Struct(stats_struct) = schema.field("stats").unwrap().data_type() else {
+            panic!("`stats` must be a struct");
+        };
+        let stats_fields: Vec<_> = stats_struct.fields().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            stats_fields,
+            ["numRecords", "minValues", "tightBounds"],
+            "`stats` carries the physical_stats_schema verbatim (physical leaf names)",
+        );
+
+        // stats NOT requested => terminal is byte-identical to the four-field shape even though
+        // the input carries `stats_parsed`.
+        let (_ctx, builder) = make_input_builder_with_stats(None, Some(&stats));
+        let out = project_scan_file_row(builder, None, None).unwrap();
+        let fields: Vec<_> = out
+            .schema()
+            .unwrap()
+            .fields()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            fields,
+            ["path", "size", "deletionVector", FILE_CONSTANT_VALUES_NAME],
+            "stats not requested => no `stats` column, four-field shape unchanged",
         );
     }
 }
