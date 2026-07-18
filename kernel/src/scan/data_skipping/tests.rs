@@ -1553,3 +1553,122 @@ fn checkpoint_pushdown_non_stat_arm_folds_to_null_literal() {
         "AND(OR(Column(maxValues.stat) IS NULL, Column(maxValues.stat) > 100), null)"
     );
 }
+
+// === SSA add-stats skipping predicate (Stage-5 Layer-1 kernel change) ====================
+
+/// `x >= 4` over stats column `x` rewrites to the SQL-WHERE skipping form and prefixes every stats
+/// ref with `add` (the rewriter already roots at `stats_parsed`, so the result lands on
+/// `add.stats_parsed.*` — the reconciled live-add row shape). Asserting on `references()` (not the
+/// exact rewrite string, which is `eval_sql_where`'s NULL-safe expansion) keeps the test robust to
+/// rewrite-form changes; the semantic keep/skip behavior is checked separately.
+#[test]
+fn ssa_add_stats_prefixes_refs_under_add_stats_parsed() {
+    let pred = Pred::ge(column_expr!("x"), Expr::literal(4i64));
+    let stats = stats_cols(&["x"]);
+    let result = as_ssa_add_stats_skipping_predicate(&pred, &stats).unwrap();
+    // Every column reference must sit under `add.stats_parsed` (exactly once — no double prefix).
+    let root = ColumnName::new(["add", "stats_parsed"]);
+    for c in result.references() {
+        assert!(
+            c.path().starts_with(root.path()),
+            "ref {c} must be under add.stats_parsed"
+        );
+        assert_ne!(
+            &c.path()[..2.min(c.path().len())],
+            &["add".to_string(), "add".to_string()][..],
+            "ref {c} must not be double-prefixed"
+        );
+        // The rewriter's own `stats_parsed` root must appear exactly once, at position 1.
+        assert_eq!(
+            c.path()
+                .iter()
+                .filter(|s| s.as_str() == "stats_parsed")
+                .count(),
+            1,
+            "ref {c} must carry a single stats_parsed segment"
+        );
+    }
+}
+
+/// Semantic check: evaluated against per-file stats, the prefixed skipping predicate keeps a file
+/// whose `[min,max]` overlaps the query range and prunes one entirely below it. This is the exact
+/// keep/skip decision the SSA `FilterNode` makes over the reconciled rows.
+///
+/// Data-skipping is a SQL-WHERE filter (`eval_sql_where`): a file is **pruned** only when the
+/// predicate evaluates to `FALSE`; `TRUE` **or** `NULL` (missing/ambiguous stats) keeps it. So the
+/// keep assertion is "not FALSE", not "TRUE".
+#[test]
+fn ssa_add_stats_keeps_overlapping_prunes_below_range() {
+    let pred = Pred::ge(column_expr!("id"), Expr::literal(4i64));
+    let stats = stats_cols(&["id"]);
+    let skipping = as_ssa_add_stats_skipping_predicate(&pred, &stats).unwrap();
+
+    // Provide the full stat set the SQL-WHERE expansion references (max + nullCount + numRecords),
+    // so the predicate evaluates to a concrete bool rather than folding to NULL on a missing ref.
+    let eval = |min: i64, max: i64| {
+        let resolver = HashMap::from_iter([
+            (
+                column_name!("add.stats_parsed.minValues.id"),
+                Scalar::from(min),
+            ),
+            (
+                column_name!("add.stats_parsed.maxValues.id"),
+                Scalar::from(max),
+            ),
+            (
+                column_name!("add.stats_parsed.nullCount.id"),
+                Scalar::from(0i64),
+            ),
+            (
+                column_name!("add.stats_parsed.numRecords"),
+                Scalar::from(3i64),
+            ),
+        ]);
+        DefaultKernelPredicateEvaluator::from(resolver).eval(&skipping)
+    };
+    // File A id∈[1,3]: entirely below 4 → pruned (predicate FALSE).
+    expect_eq!(eval(1, 3), FALSE, "id∈[1,3] with `id >= 4` must prune");
+    // File B id∈[4,6]: overlaps → kept (predicate not FALSE).
+    assert_ne!(eval(4, 6), FALSE, "id∈[4,6] with `id >= 4` must keep");
+}
+
+/// A predicate with no min/max-eligible arm (a bare column-vs-column comparison) must never wrongly
+/// prune: `eval_sql_where` folds the ineligible comparison to a conservative keep-all rather than
+/// returning `None`, so a valid file (any stats) must evaluate to "not FALSE" (kept). This guards
+/// the correctness contract — data skipping only ever removes files it can prove cannot match.
+#[test]
+fn ssa_add_stats_ineligible_predicate_never_prunes() {
+    let pred = Pred::gt(column_expr!("x"), column_expr!("y"));
+    let stats = stats_cols(&["x", "y"]);
+    let skipping = as_ssa_add_stats_skipping_predicate(&pred, &stats)
+        .expect("eval_sql_where folds ineligible arms to a keep-all rather than None");
+    // Refs stay under `add.stats_parsed` (the guard did not bail).
+    let root = ColumnName::new(["add", "stats_parsed"]);
+    assert!(
+        skipping
+            .references()
+            .into_iter()
+            .all(|c| c.path().starts_with(root.path())),
+        "ineligible-fold refs must still be under add.stats_parsed: {skipping}"
+    );
+    // Any concrete stats → never FALSE (never prunes a file it cannot prove non-matching).
+    let resolver = HashMap::from_iter([
+        (
+            column_name!("add.stats_parsed.nullCount.x"),
+            Scalar::from(0i64),
+        ),
+        (
+            column_name!("add.stats_parsed.nullCount.y"),
+            Scalar::from(0i64),
+        ),
+        (
+            column_name!("add.stats_parsed.numRecords"),
+            Scalar::from(3i64),
+        ),
+    ]);
+    assert_ne!(
+        DefaultKernelPredicateEvaluator::from(resolver).eval(&skipping),
+        FALSE,
+        "an ineligible predicate must never prune a valid file"
+    );
+}

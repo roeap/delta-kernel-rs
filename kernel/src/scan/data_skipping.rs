@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock};
 use tracing::{debug, error};
 
 use crate::actions::visitors::SelectionVectorVisitor;
-use crate::actions::{MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
+use crate::actions::{ADD_NAME, MAX_VALUES, MIN_VALUES, NULL_COUNT, NUM_RECORDS};
 use crate::error::DeltaResult;
 use crate::expressions::{
     column_expr, column_name, joined_column_expr, BinaryPredicateOp, ColumnName,
@@ -85,6 +85,69 @@ pub(crate) fn as_sql_data_skipping_predicate_with_stats_columns(
     stats_columns: &HashSet<ColumnName>,
 ) -> Option<Pred> {
     DataSkippingPredicateCreator::new(partition_columns, stats_columns).eval_sql_where(pred)
+}
+
+/// Build a data-skipping predicate over the reconciled **live add-action** rows of the `sm_plans`
+/// SSA scan path, where per-file stats live under `add.stats_parsed.{minValues,maxValues,nullCount}`
+/// / `add.stats_parsed.numRecords` (physical leaf names).
+///
+/// This is the engine-free, declarative sibling of the classic [`DataSkippingFilter`]: it produces
+/// a plain [`Pred`] the caller appends as an SSA `FilterNode` (evaluated lazily by the same engine
+/// that runs every other reconciliation filter), rather than an eager evaluator wrapper.
+///
+/// Scope: **stats-only** (min/max/nullCount) skipping. Partition-value skipping is *not* attempted —
+/// `partition_columns` is passed empty, so partition predicates fold away rather than emitting
+/// `partitionValues_parsed` / `is_add` references the reconciled stream does not carry. As a
+/// belt-and-suspenders guard against any construct that would reference a non-stats column (e.g. an
+/// opaque predicate's `is_add` remove-guard), this returns `None` — skip nothing, keep every file —
+/// if the rewritten+prefixed predicate references any column outside `add.stats_parsed`. Correctness
+/// is unaffected: skipping is a pure optimization and the reconciled rows here are all live adds.
+///
+/// Returns `None` (no skipping filter) when the predicate is not eligible for data skipping.
+pub(crate) fn as_ssa_add_stats_skipping_predicate(
+    pred: &Pred,
+    stats_columns: &HashSet<ColumnName>,
+) -> Option<Pred> {
+    use crate::transforms::ExpressionTransform as _;
+
+    // Stats-only: no partition columns, so partition predicates fold to NULL rather than emitting
+    // `partitionValues_parsed` / `is_add` references.
+    let empty_partitions = HashSet::new();
+    let skipping =
+        as_sql_data_skipping_predicate_with_stats_columns(pred, &empty_partitions, stats_columns)?;
+
+    // The rewriter already roots stats refs at `stats_parsed.*` (e.g. `stats_parsed.maxValues.x`);
+    // the reconciled rows nest that struct under `add.*`, so prefix with just `add` to land on
+    // `add.stats_parsed.*`.
+    let prefixed = PrefixColumns {
+        prefix: ColumnName::new([ADD_NAME]),
+    }
+    .transform_pred(&skipping)
+    .into_owned();
+
+    // Conservative guard: if any reference escaped `add.stats_parsed` (an opaque `is_add` guard, a
+    // leaked partition ref), the reconciled stream cannot evaluate it — bail rather than error.
+    let stats_root = ColumnName::new([ADD_NAME, "stats_parsed"]);
+    let all_under_stats = prefixed
+        .references()
+        .into_iter()
+        .all(|c| c.path().starts_with(stats_root.path()));
+    all_under_stats.then_some(prefixed)
+}
+
+/// Prefixes all column references in a predicate with a fixed path -- e.g. rewrites the
+/// `stats_parsed.minValues.x` refs [`as_sql_data_skipping_predicate_with_stats_columns`] emits into
+/// `add.stats_parsed.minValues.x` for the reconciled add-action row shape.
+pub(crate) struct PrefixColumns {
+    pub(crate) prefix: ColumnName,
+}
+
+impl<'a> crate::transforms::ExpressionTransform<'a> for PrefixColumns {
+    crate::transforms::transform_output_type!(|'a, T| std::borrow::Cow<'a, T>);
+
+    fn transform_expr_column(&mut self, name: &'a ColumnName) -> std::borrow::Cow<'a, ColumnName> {
+        std::borrow::Cow::Owned(self.prefix.join(name))
+    }
 }
 
 #[internal_api]

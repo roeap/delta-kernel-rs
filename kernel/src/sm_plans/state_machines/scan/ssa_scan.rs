@@ -17,9 +17,10 @@ use super::ssa_reconciliation::{
 };
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::ADD_NAME;
-use crate::expressions::{col, ColumnName, Expression};
+use crate::expressions::{col, ColumnName, Expression, Predicate};
+use crate::scan::data_skipping::as_ssa_add_stats_skipping_predicate;
 use crate::scan::log_replay::FILE_CONSTANT_VALUES_NAME;
-use crate::scan::Scan;
+use crate::scan::{PhysicalPredicate, Scan};
 use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema};
 use crate::sm_plans::errors::DeltaError;
 use crate::sm_plans::ir::nodes::{default_scan_file_columns, DvRef, FileType};
@@ -77,6 +78,13 @@ pub(super) async fn build_scan_ssa(
     )
     .await?;
 
+    // === Data-skipping: prune the live-add rows by their per-file stats ================
+    // Engine-free / declarative: when the scan carries a predicate and stats are present, append a
+    // `FilterNode` over `add.stats_parsed` (evaluated lazily by the same engine that runs every
+    // other reconciliation filter). Stats-only (min/max/nullCount); a no-predicate scan is
+    // byte-identical to before. See `apply_data_skipping_ssa`.
+    let reconciled = apply_data_skipping_ssa(reconciled, scan)?;
+
     // === Scan-specific terminal projection: reconciled -> flat scan_file_row ==========
     let live_actions = project_scan_file_row(reconciled, parts.as_ref(), terminal_stats.as_ref())?;
 
@@ -85,6 +93,40 @@ pub(super) async fn build_scan_ssa(
         do_data_stage_ssa(scan, live_actions)
     } else {
         Ok(live_actions)
+    }
+}
+
+/// Append a data-skipping [`crate::sm_plans::ir::nodes::FilterNode`] over the reconciled live-add
+/// rows, keying on `add.stats_parsed.{minValues,maxValues,nullCount}` / `numRecords`.
+///
+/// This is the `sm_plans` (engine-free, declarative) counterpart to the classic scan path's
+/// [`crate::scan::log_replay`] `DataSkippingFilter`: instead of an eager evaluator wrapper, it adds
+/// a plan node the SSA executor evaluates lazily like every other reconciliation filter, so it works
+/// on wasm / async without an extra blocking evaluation path.
+///
+/// Behavior by predicate state (read directly off `StateInfo`, since `Scan::physical_predicate()`
+/// collapses `StaticSkipAll` to `None`):
+/// - `PhysicalPredicate::None` → no filter (byte-identical to the pre-skipping plan);
+/// - `PhysicalPredicate::StaticSkipAll` → a constant-`false` filter (the predicate can never hold,
+///   so no file survives) — mirrors the classic path's skip-all short-circuit;
+/// - `PhysicalPredicate::Some(pred, _)` → the stats-only skipping predicate from
+///   [`as_ssa_add_stats_skipping_predicate`], or no filter when the predicate is not eligible for
+///   data skipping (conservative: keep every file).
+fn apply_data_skipping_ssa(
+    reconciled: PlanBuilder,
+    scan: &Scan,
+) -> Result<PlanBuilder, DeltaError> {
+    let state_info = scan.state_info();
+    match &state_info.physical_predicate {
+        PhysicalPredicate::None => Ok(reconciled),
+        PhysicalPredicate::StaticSkipAll => reconciled.filter(Predicate::literal(false)),
+        PhysicalPredicate::Some(predicate, _) => {
+            match as_ssa_add_stats_skipping_predicate(predicate, &state_info.physical_stats_columns)
+            {
+                Some(skipping) => reconciled.filter(skipping),
+                None => Ok(reconciled),
+            }
+        }
     }
 }
 

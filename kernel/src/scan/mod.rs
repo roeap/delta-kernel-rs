@@ -9,7 +9,7 @@ use itertools::Itertools;
 use tracing::{debug, info};
 use url::Url;
 
-use self::data_skipping::as_checkpoint_skipping_predicate;
+use self::data_skipping::{as_checkpoint_skipping_predicate, PrefixColumns};
 use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -541,21 +541,6 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
         self.folded_logical_path.pop();
         self.physical_path.pop();
         Some(Cow::Owned(field?.with_name(physical_name)))
-    }
-}
-
-/// Prefixes all column references in a predicate with a fixed path.
-/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
-/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
-struct PrefixColumns {
-    prefix: ColumnName,
-}
-
-impl<'a> ExpressionTransform<'a> for PrefixColumns {
-    transform_output_type!(|'a, T| Cow<'a, T>);
-
-    fn transform_expr_column(&mut self, name: &'a ColumnName) -> Cow<'a, ColumnName> {
-        Cow::Owned(self.prefix.join(name))
     }
 }
 
