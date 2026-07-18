@@ -5,7 +5,7 @@
 mod file_scan;
 pub mod full_state;
 mod ssa_reconciliation;
-mod ssa_scan;
+pub(crate) mod ssa_scan;
 
 pub use full_state::{FullState, FullStateBuilder};
 pub use ssa_reconciliation::CommitFileMeta;

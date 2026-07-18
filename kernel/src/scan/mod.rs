@@ -678,6 +678,27 @@ impl Scan {
         self.state_info.physical_partition_schema.clone()
     }
 
+    /// The flat `scan_file_row` schema the **metadata** scan state machines emit
+    /// ([`Self::scan_metadata_state_machine`] / [`Self::scan_stats_metadata_state_machine`]),
+    /// computed **without driving** the state machine.
+    ///
+    /// This is a pure function of the table schema + this scan's stats/partition options — the same
+    /// schema-assembly the terminal projection uses, so the two cannot drift. The `stats` /
+    /// `partitionValues_parsed` sub-structs are named in **logical** (table-facing) terms, matching
+    /// the metadata terminal. The top-level `stats` sibling is present exactly when the scan was
+    /// built requesting struct stats (`ScanBuilder::with_stats(StatsOptions::all_struct())`, which
+    /// makes `physical_stats_schema()` `Some`) — i.e. it matches
+    /// [`Self::scan_stats_metadata_state_machine`]; a scan without struct stats yields the four-field
+    /// shape ([`Self::scan_metadata_state_machine`]).
+    ///
+    /// Intended for a `TableProvider` that surfaces the reconciled scan-file rows: it can declare a
+    /// cheap, infallible `schema()` from this without a planning drive.
+    #[cfg(feature = "sm-plans")]
+    #[internal_api]
+    pub(crate) fn scan_file_row_schema(&self) -> SchemaRef {
+        crate::sm_plans::state_machines::scan::ssa_scan::scan_file_row_schema(self)
+    }
+
     /// Internal accessor for the scan's [`StateInfo`]. The scan SM data stage uses the
     /// precomputed transform spec to drive its physical->logical projection instead of
     /// re-deriving partition / row-id / row-index classification from the snapshot.
