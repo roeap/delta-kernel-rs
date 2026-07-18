@@ -742,10 +742,15 @@ fn sidecar_file_schema(base: &SchemaRef, stats: Option<&SsaStatsInfo>) -> Schema
     }
 }
 
-/// Build a checkpoint Load `file_schema` that swaps `add.stats: STRING` for
-/// `add.stats_parsed: stats_schema`. Parquet checkpoints with native parsed stats don't
-/// carry the JSON form, so asking the engine for both columns would be wasted I/O.
-fn stats_parsed_file_schema(base: &SchemaRef, stats_schema: &SchemaRef) -> SchemaRef {
+/// Swap `add.stats: STRING` for `add.stats_parsed: stats_schema` inside a `base` action
+/// schema, leaving every other slot untouched.
+///
+/// Used two ways: as a checkpoint Load `file_schema` (parquet checkpoints with native parsed
+/// stats don't carry the JSON form, so asking the engine for both columns would be wasted I/O),
+/// and — since it reproduces exactly the in-place edit [`ReconciliationPlanBuilder::with_json_stats_parsed`]
+/// applies to the reconciled `add` slot — as the pure schema derivation behind
+/// [`super::full_state::FullState::output_schema`].
+pub(super) fn stats_parsed_file_schema(base: &SchemaRef, stats_schema: &SchemaRef) -> SchemaRef {
     let new_fields: Vec<StructField> = base
         .fields()
         .map(|f| {
