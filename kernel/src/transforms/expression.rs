@@ -8,8 +8,8 @@ use crate::expressions::{
     UnaryPredicate, VariadicExpression,
 };
 use crate::transforms::{
-    map_owned_children_or_else, map_owned_or_else, map_owned_pair_or_else,
-    map_owned_triple_or_else, transform_output_type, Carrier,
+    carrier_into_inner_opt, carrier_try_none, map_owned_children_or_else, map_owned_or_else,
+    map_owned_pair_or_else, map_owned_triple_or_else, transform_output_type, Carrier,
 };
 use crate::{DeltaResult, Error};
 
@@ -237,8 +237,40 @@ pub trait ExpressionTransform<'a> {
                 map_owned_or_else(expr, child, Expression::from)
             }
             Expression::Struct(s, nullability) => {
-                let map_owned = |exprs| Expression::Struct(exprs, nullability.clone());
-                map_owned_or_else(expr, self.transform_expr_struct(s), map_owned)
+                // Transform the field expressions (the variadic child-list).
+                let Some(fields) = carrier_into_inner_opt!(self.transform_expr_struct(s)) else {
+                    // All fields filtered out => drop the struct (only reachable for filtering
+                    // carriers; non-filtering carriers never yield `Ok(None)`).
+                    carrier_try_none!();
+                    unreachable!();
+                };
+                // Transform the optional nullability predicate. It is stored as an `Expression`
+                // (`Struct(Vec<ExpressionRef>, Option<ExpressionRef>)`), so it must be walked too
+                // — otherwise a column-rename / root-collection transform silently skips it (which
+                // broke the FSR reconciled-action lowering: the rebuilt `add`'s nullability
+                // predicate referenced a column the DataFusion root-rename never rewrote).
+                let nullability = match nullability {
+                    None => None,
+                    Some(pred) => {
+                        let child: Self::Output<ExpressionRef> =
+                            map_owned_or_else(pred, self.transform_expr(pred), Arc::new);
+                        let Some(pred) = carrier_into_inner_opt!(child) else {
+                            carrier_try_none!();
+                            unreachable!();
+                        };
+                        Some(pred)
+                    }
+                };
+                // Borrow-preserve only when BOTH children are unchanged (or the predicate absent).
+                let fields_borrowed = matches!(fields, Cow::Borrowed(_));
+                let nullability_borrowed = matches!(nullability, None | Some(Cow::Borrowed(_)));
+                if fields_borrowed && nullability_borrowed {
+                    Carrier::from_inner(Cow::Borrowed(expr))
+                } else {
+                    let fields = fields.into_owned();
+                    let nullability = nullability.map(Cow::into_owned);
+                    Carrier::from_inner(Cow::Owned(Expression::Struct(fields, nullability)))
+                }
             }
             Expression::StructPatch(t) => {
                 let child = self.transform_expr_struct_patch(t);
@@ -640,6 +672,68 @@ mod tests {
                 Cow::Borrowed(name)
             }
         }
+    }
+
+    /// A column-rename transform must descend into a `Struct`'s nullability predicate, not just its
+    /// field expressions. Regression guard for the FSR reconciled-action lowering: the rebuilt
+    /// `add` slot carries a `struct_with_nullability_from` predicate referencing a column, and the
+    /// DataFusion root-rename (an `ExpressionTransform`) must rewrite it — before this, the arm
+    /// cloned the predicate untouched and the rewrite left a dangling column ref.
+    #[test]
+    fn test_transform_expr_struct_renames_nullability_predicate() {
+        let nullability = Arc::new(Expr::from(column_pred!("old_col")));
+        let struct_expr =
+            Expression::Struct(vec![Arc::new(column_expr!("unchanged"))], Some(nullability));
+
+        let result = ColumnReplacer.transform_expr(&struct_expr);
+
+        // The predicate referenced `old_col`, so the struct must be rebuilt owned.
+        let Cow::Owned(Expression::Struct(fields, Some(pred))) = result else {
+            panic!("expected owned struct with a rewritten nullability predicate");
+        };
+        assert_eq!(fields.len(), 1, "fields untouched");
+        assert_eq!(
+            pred,
+            Arc::new(Expr::from(column_pred!("new_col"))),
+            "nullability predicate `old_col` must be renamed to `new_col`",
+        );
+    }
+
+    /// A `Struct` with `None` nullability and no changed children is returned borrowed (the added
+    /// predicate traversal must not perturb the borrow-optimization when there is no predicate).
+    #[test]
+    fn test_transform_expr_struct_none_nullability_stays_borrowed() {
+        let struct_expr = Expression::Struct(vec![Arc::new(column_expr!("unchanged"))], None);
+        let result = ColumnReplacer.transform_expr(&struct_expr);
+        assert!(
+            matches!(result, Cow::Borrowed(_)),
+            "unchanged struct with no nullability predicate stays borrowed",
+        );
+    }
+
+    /// A filtering transform that drops the nullability predicate's only column drops the whole
+    /// struct — the predicate is a real child for filtering purposes, not an opaque clone.
+    #[test]
+    fn test_transform_expr_struct_filtered_predicate_drops_struct() {
+        struct ColumnRemover;
+        impl<'a> ExpressionTransform<'a> for ColumnRemover {
+            transform_output_type!(|'a, T| Option<Cow<'a, T>>);
+
+            fn transform_expr_column(
+                &mut self,
+                _name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                None
+            }
+        }
+
+        let nullability = Arc::new(Expr::from(column_pred!("gate")));
+        let struct_expr = Expression::Struct(vec![Arc::new(Expr::literal(1))], Some(nullability));
+        let result = ColumnRemover.transform_expr(&struct_expr);
+        assert!(
+            result.is_none(),
+            "dropping the nullability predicate's column filters out the struct",
+        );
     }
 
     #[test]
