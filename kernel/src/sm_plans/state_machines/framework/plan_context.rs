@@ -1093,7 +1093,11 @@ fn split_parent_leaf<'a>(
 ///
 /// Walks the schema down `parent_path`, identity-projecting siblings via `col(...)`
 /// references, then applies `op` at the targeted struct. Each ancestor struct above the
-/// edit is rebuilt with [`Expression::struct_from`].
+/// edit is rebuilt with [`Expression::struct_with_nullability_from`] keyed on a required
+/// (non-nullable) child of that struct being non-null, so a rebuilt struct preserves the
+/// input's top-level null-ness (a bare `struct_from` rebuild would instead force a present,
+/// all-NULL-children struct on rows where the ancestor was NULL). Ancestors with no required
+/// child fall back to a plain [`Expression::struct_from`] rebuild.
 fn apply_field_op(
     builder: PlanBuilder,
     input_schema: &StructType,
@@ -1154,7 +1158,30 @@ fn rewrite_at(
                 f.is_nullable(),
             ));
             let exprs: Vec<ExpressionRef> = sub_named.into_iter().map(|(_, e)| e).collect();
-            named_exprs.push((fname, Arc::new(Expression::struct_from(exprs))));
+            // Preserve the rebuilt struct's top-level null-ness. `struct_from` alone always
+            // yields a *present* struct (no null buffer), so an ancestor that was top-level NULL
+            // in the input would come back as a present struct with all-NULL children — e.g. a
+            // reconciled non-`add` row would sprout a present, all-null `add` after a nested
+            // `replace_col([add, stats], ...)`. Key the rebuilt struct's null buffer on a
+            // *required* (non-nullable) child of the ORIGINAL sub-struct being non-null: a
+            // required field is present exactly when its parent struct is, so this reproduces
+            // the input's top-level validity. Keying on a child leaf (rather than the parent
+            // column itself) is deliberate — the `ExpressionTransform`-based root-rename in the
+            // DataFusion lowering rewrites child column refs but not a `Struct`'s nullability
+            // predicate, and a required child is a faithful proxy for the parent's validity.
+            // If the sub-struct has no required child, fall back to the plain `struct_from`
+            // rebuild (prior behavior) rather than emit an unkeyable predicate.
+            let required_child = sub.fields().find(|cf| !cf.is_nullable());
+            let struct_expr = match required_child {
+                Some(cf) => {
+                    let mut leaf_path = sub_path.clone();
+                    leaf_path.push(cf.name().clone());
+                    let present: Expression = Expression::column(leaf_path).is_not_null().into();
+                    Expression::struct_with_nullability_from(exprs, present)
+                }
+                None => Expression::struct_from(exprs),
+            };
+            named_exprs.push((fname, Arc::new(struct_expr)));
             found = true;
         } else {
             named_exprs.push((fname.clone(), col_ref_at(path_so_far, &fname)));
@@ -1578,6 +1605,98 @@ mod tests {
         assert_eq!(
             add.field("stats_parsed").unwrap().data_type(),
             &DataType::Struct(Box::new(stats_struct)),
+        );
+    }
+
+    /// `add` schema whose `path` child is REQUIRED (non-nullable), matching the real Delta `Add`
+    /// action (`path: String`). Used to exercise the required-child nullability keying.
+    fn nested_add_required_path_schema() -> SchemaRef {
+        let add = StructType::try_new(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::nullable("stats", DataType::STRING),
+        ])
+        .unwrap();
+        Arc::new(
+            StructType::try_new(vec![
+                StructField::nullable("add", DataType::Struct(Box::new(add))),
+                StructField::nullable("remove", DataType::STRING),
+            ])
+            .unwrap(),
+        )
+    }
+
+    /// Pull the rebuilt `add` projection expression out of the sole `Project` node.
+    fn rebuilt_add_expr(result_plan: &ResultPlan) -> Expression {
+        result_plan
+            .plan
+            .stmts
+            .iter()
+            .find_map(|n| match &n.kind {
+                NodeKind::Project(p) => Some(p),
+                _ => None,
+            })
+            .expect("a Project node materializes the rewrite")
+            .named_exprs
+            .iter()
+            .find(|(name, _)| name == "add")
+            .map(|(_, e)| e.as_ref().clone())
+            .expect("`add` is rebuilt in the projection")
+    }
+
+    /// A nested `replace_col` rebuilds the ancestor struct with a nullability predicate keyed on a
+    /// REQUIRED child of the original struct, so the rebuilt struct preserves the input's
+    /// top-level null-ness (regression guard: a bare `struct_from` rebuild would force a present,
+    /// all-NULL struct on rows where the ancestor was NULL — e.g. a reconciled non-`add` row
+    /// sprouting a present `add`). Keying on the child (not the parent column) keeps the predicate
+    /// visible to the DataFusion lowering's root-rename, which does not descend into a `Struct`'s
+    /// nullability predicate.
+    #[test]
+    fn replace_col_nested_rebuild_keys_nullability_on_required_child() {
+        let ctx = Context::new();
+        let src = ctx
+            .values(nested_add_required_path_schema(), vec![])
+            .unwrap();
+        let out = src
+            .replace_col(
+                ["add", "stats"],
+                StructField::nullable("stats", DataType::STRING),
+                col(["add", "stats"]),
+            )
+            .unwrap();
+        let result_plan = ctx.into_result_plan(out).unwrap();
+        match rebuilt_add_expr(&result_plan) {
+            Expression::Struct(_, Some(pred)) => {
+                assert_eq!(
+                    format!("{pred}"),
+                    format!("{}", Expression::from(col(["add", "path"]).is_not_null())),
+                    "rebuilt `add` nullability must key on the required child `add.path`",
+                );
+            }
+            other => panic!(
+                "rebuilt `add` must carry a nullability predicate (Struct(_, Some(_))), got \
+                 {other:?}",
+            ),
+        }
+    }
+
+    /// When the rebuilt ancestor struct has NO required child, `rewrite_at` falls back to a plain
+    /// `struct_from` (no nullability predicate) rather than emit an unkeyable one.
+    #[test]
+    fn replace_col_nested_rebuild_falls_back_without_required_child() {
+        let ctx = Context::new();
+        // `nested_add_schema`'s `add` has all-nullable children.
+        let src = ctx.values(nested_add_schema(), vec![]).unwrap();
+        let out = src
+            .replace_col(
+                ["add", "stats"],
+                StructField::nullable("stats", DataType::STRING),
+                col(["add", "stats"]),
+            )
+            .unwrap();
+        let result_plan = ctx.into_result_plan(out).unwrap();
+        assert!(
+            matches!(rebuilt_add_expr(&result_plan), Expression::Struct(_, None)),
+            "no required child => plain struct_from rebuild",
         );
     }
 
