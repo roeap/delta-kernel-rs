@@ -318,3 +318,8 @@ optional = true
 
 [build-dependencies.rustc_version]
 version = "0.4.1"
+
+# wasm32 support (ported from the roeap fork): `js-sys` backs the `Instant`/`SystemTime` shims in
+# `src/time.rs`, since std's clocks panic on wasm32-unknown-unknown.
+[target.'cfg(target_arch = "wasm32")'.dependencies.js-sys]
+version = "0.3"

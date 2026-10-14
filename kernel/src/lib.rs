@@ -73,9 +73,11 @@ extern crate self as delta_kernel;
 
 use std::any::Any;
 use std::cmp::Ordering;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::DirEntry;
 use std::ops::Range;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -89,6 +91,7 @@ pub mod cancellation;
 pub mod checkpoint;
 pub mod commit_range;
 pub mod committer;
+pub(crate) mod time;
 #[cfg(feature = "adaptive-metadata-in-dev")]
 mod content_tree;
 #[cfg(feature = "internal-api")]
@@ -252,6 +255,9 @@ impl PartialOrd for FileMeta {
     }
 }
 
+// `DirEntry` is a native-filesystem construct (`std::fs::read_dir`); local-directory listing is
+// unavailable on wasm, so this conversion is native-only.
+#[cfg(not(target_arch = "wasm32"))]
 impl TryFrom<DirEntry> for FileMeta {
     type Error = Error;
 

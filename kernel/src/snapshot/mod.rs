@@ -209,7 +209,7 @@ impl Snapshot {
         incremental_replay: IncrementalReplay,
         built_as_latest: bool,
     ) -> DeltaResult<Self> {
-        let pm_start = std::time::Instant::now();
+        let pm_start = crate::time::Instant::now();
 
         // Step 1: read the latest on-disk CRC and, if usable, advance it to the end version
         //         (or use it as-is when already there) per `incremental_replay`.

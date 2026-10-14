@@ -329,7 +329,7 @@ impl LogSegment {
         cancellation_token: Option<&CancellationTokenRef>,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
-        let start = std::time::Instant::now();
+        let start = crate::time::Instant::now();
         let build = || {
             let checkpoint_hint =
                 LastCheckpointHint::try_read(storage, &log_root, cancellation_token)?;

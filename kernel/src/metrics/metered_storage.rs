@@ -5,7 +5,7 @@
 //! [`MeteredDeltaEngine`]: crate::metrics::MeteredDeltaEngine
 
 use std::sync::Arc;
-use std::time::Instant;
+use crate::time::Instant;
 
 use bytes::Bytes;
 use url::Url;

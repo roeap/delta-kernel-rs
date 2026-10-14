@@ -1,7 +1,7 @@
 //! Metrics reporter trait and tracing-layer integration.
 
 use std::sync::Arc;
-use std::time::Instant;
+use crate::time::Instant;
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};

@@ -133,7 +133,7 @@ impl Snapshot {
 
         // Assemble the new segment as one fallible unit so a load failure emits exactly once, via
         // the `inspect_err` below.
-        let segment_load_start = std::time::Instant::now();
+        let segment_load_start = crate::time::Instant::now();
         let (combined_log_segment, new_end_version) = match Self::build_new_segment(
             engine,
             existing_log_segment,
@@ -178,7 +178,7 @@ impl Snapshot {
         // on-disk CRC the combined segment carries) to the new end version, subject to
         // `incremental_replay`. Time from here so the CRC-advance cost lands in the P&M duration,
         // matching the fresh path.
-        let pm_start = std::time::Instant::now();
+        let pm_start = crate::time::Instant::now();
         let base_crc =
             combined_log_segment.pick_latest_base_crc(engine, existing_snapshot.base_crc());
         let crc_at_version = combined_log_segment

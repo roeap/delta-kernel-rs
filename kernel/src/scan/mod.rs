@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use crate::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
