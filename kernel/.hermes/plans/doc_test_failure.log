@@ -1,0 +1,280 @@
+Compiling buoyant_kernel v0.25.0 (/home/tyler/source/github/delta-io/delta-kernel-rs/kernel)
+warning: unused variable: `engine`
+   --> kernel/src/scan/log_replay.rs:354:9
+    |
+354 |         engine: &dyn Engine,
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_engine`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `operation_id`
+  --> kernel/src/parallel/parallel_scan_metadata.rs:90:13
+   |
+90 |             operation_id,
+   |             ^^^^^^^^^^^^ help: try ignoring the field: `operation_id: _`
+
+warning: function `validate_latest_commit_file` is never used
+    --> kernel/src/log_segment/mod.rs:1713:4
+     |
+1713 | fn validate_latest_commit_file(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `new_with_deferred_parallel_checkpoint_planning` is never used
+  --> kernel/src/parallel/parallel_scan_metadata.rs:64:19
+   |
+46 | impl SequentialScanMetadata {
+   | --------------------------- associated function in this implementation
+...
+64 |     pub(crate) fn new_with_deferred_parallel_checkpoint_planning(
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+   Compiling delta_kernel_default_engine v0.25.0 (/home/tyler/source/github/delta-io/delta-kernel-rs/default-engine)
+warning: `buoyant_kernel` (lib) generated 4 warnings
+   Compiling test_utils v0.25.0 (/home/tyler/source/github/delta-io/delta-kernel-rs/test-utils)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.93s
+   Doc-tests buoyant_kernel
+
+running 95 tests
+test kernel/src/actions/deletion_vector_writer.rs - actions::deletion_vector_writer::StreamingDeletionVectorWriter<'a,W>::finalize (line 354) ... ignored
+test kernel/src/actions/deletion_vector_writer.rs - actions::deletion_vector_writer::StreamingDeletionVectorWriter<'a,W>::new (line 223) ... ignored
+test kernel/src/actions/deletion_vector_writer.rs - actions::deletion_vector_writer::StreamingDeletionVectorWriter<'a,W>::write_deletion_vector (line 258) ... ignored
+test kernel/src/checkpoint/mod.rs - checkpoint::CheckpointWriter::checkpoint_data (line 450) ... ignored
+test kernel/src/checkpoint/mod.rs - checkpoint (line 35) - compile ... ok
+test kernel/src/doctests/into_engine_data.rs - doctests::into_engine_data::MacroTestTupleStruct (line 35) - compile fail ... ok
+test kernel/src/doctests/into_engine_data.rs - doctests::into_engine_data::MacroTestStructWithoutField (line 26) - compile fail ... ok
+test kernel/src/commit_range/mod.rs - commit_range (line 19) - compile ... FAILED
+test kernel/src/doctests/to_schema.rs - doctests::to_schema::MacroTestStructWithInvalidAttributeTarget (line 48) - compile fail ... ok
+test kernel/src/doctests/to_schema.rs - doctests::to_schema::MacroTestStructWithInvalidFieldType (line 89) - compile fail ... ok
+test kernel/src/doctests/to_schema.rs - doctests::to_schema::MacroTestStructWithInvalidOptionalAttributeTarget (line 77) - compile fail ... ok
+test kernel/src/doctests/into_engine_data.rs - doctests::into_engine_data::MacroTestStructWithField (line 14) ... ok
+test kernel/src/doctests/to_schema.rs - doctests::to_schema::MacroTestStructWithField (line 3) ... ok
+test kernel/src/actions/deletion_vector_writer.rs - actions::deletion_vector_writer::DeletionVector (line 23) ... ok
+test kernel/src/engine_data.rs - engine_data::FilteredEngineData::from (line 100) ... ignored
+test kernel/src/doctests/to_schema.rs - doctests::to_schema::MacroTestStructWithAttributedField (line 35) ... ok
+test kernel/src/doctests/to_schema.rs - doctests::to_schema::MacroTestStructWithAngleBracketedPathField (line 23) ... ok
+test kernel/src/doctests/to_schema.rs - doctests::to_schema::MacroTestStructWithOptionalAttributedField (line 63) ... ok
+test kernel/src/doctests/to_schema.rs - doctests::to_schema::MacroTestStructWithoutField (line 14) - compile fail ... ok
+test kernel/src/engine_data.rs - engine_data::EngineData (line 478) ... ok
+test kernel/src/expressions/column_names.rs - expressions::column_names::ColumnName (line 203) ... ok
+test kernel/src/expressions/column_names.rs - expressions::column_names::ColumnName::from_naive_str_split (line 30) ... ok
+test kernel/src/actions/deletion_vector_writer.rs - actions::deletion_vector_writer::KernelDeletionVector (line 114) ... ok
+test kernel/src/actions/deletion_vector_writer.rs - actions::deletion_vector_writer::StreamingDeletionVectorWriter (line 195) ... ok
+test kernel/src/expressions/column_names.rs - expressions::column_names::ColumnName (line 266) ... ok
+test kernel/src/expressions/column_names.rs - expressions::column_names::ColumnName (line 186) ... ok
+test kernel/src/expressions/column_names.rs - expressions::column_names::ColumnName (line 194) ... ok
+test kernel/src/expressions/column_names.rs - expressions::column_names::ColumnName (line 256) ... ok
+test kernel/src/history_manager/mod.rs - history_manager::first_version_after (line 559) ... ignored
+test kernel/src/history_manager/mod.rs - history_manager::latest_version_as_of (line 518) ... ignored
+test kernel/src/history_manager/mod.rs - history_manager::timestamp_range_to_versions (line 616) ... ignored
+test kernel/src/history_manager/mod.rs - history_manager::timestamp_to_version (line 359) ... ignored
+test kernel/src/history_manager/search.rs - history_manager::search::binary_search_by_key_with_bounds (line 106) ... ignored
+test kernel/src/history_manager/search.rs - history_manager::search::binary_search_by_key_with_bounds (line 123) ... ignored
+test kernel/src/history_manager/search.rs - history_manager::search::binary_search_by_key_with_bounds (line 140) ... ignored
+test kernel/src/history_manager/search.rs - history_manager::search::binary_search_by_key_with_bounds (line 88) ... ignored
+test kernel/src/lib.rs - AsAny (line 289) ... ok
+test kernel/src/lib.rs - AsAny::any_ref (line 336) ... ok
+test kernel/src/lib.rs - AsAny::as_any (line 353) ... ok
+test kernel/src/lib.rs - AsAny::into_any (line 370) ... ok
+test kernel/src/lib.rs - IntoEngineData (line 565) ... ignored
+test kernel/src/lib.rs - ParquetHandler::read_parquet_files (line 802) ... ignored
+test kernel/src/log_compaction/mod.rs - log_compaction (line 29) - compile ... ok
+test kernel/src/metrics/metered_engine.rs - metrics::metered_engine (line 5) ... ignored
+test kernel/src/metrics/mod.rs - metrics (line 13) ... ok
+test kernel/src/metrics/mod.rs - metrics (line 42) ... ok
+test kernel/src/expressions/column_names.rs - expressions::column_names::__column_name (line 375) ... ok
+test kernel/src/expressions/column_names.rs - expressions::column_names::ColumnName::parse_column_name_list (line 45) ... ok
+test kernel/src/expressions/column_names.rs - expressions::column_names::ColumnName::parent (line 106) ... ok
+test kernel/src/parallel/sequential_phase.rs - parallel::sequential_phase::SequentialPhase (line 41) ... ignored
+test kernel/src/expressions/column_names.rs - expressions::column_names::__joined_column_name (line 411) ... ok
+test kernel/src/partition/hive.rs - partition::hive::build_partition_path (line 124) ... ignored
+test kernel/src/scan/data_skipping/stats_schema/mod.rs - scan::data_skipping::stats_schema::expected_stats_schema (line 80) ... ignored
+test kernel/src/scan/data_skipping/stats_schema/mod.rs - scan::data_skipping::stats_schema::expected_stats_schema (line 91) ... ignored
+test kernel/src/scan/state.rs - scan::state::ScanMetadata (line 148) ... ignored
+test kernel/src/schema/compare.rs - schema::compare (line 5) ... ignored
+test kernel/src/expressions/column_names.rs - expressions::column_names::__col (line 464) ... ok
+test kernel/src/schema/mod.rs - schema::StructType::field_at_path (line 1095) ... ignored
+test kernel/src/expressions/mod.rs - expressions::lit (line 42) ... ok
+test kernel/src/expressions/column_names.rs - expressions::column_names::ColumnName::join (line 80) ... ok
+test kernel/src/schema/mod.rs - schema::schema (line 105) - compile fail ... ok
+test kernel/src/schema/mod.rs - schema::schema (line 85) ... FAILED
+test kernel/src/schema/mod.rs - schema::schema (line 68) ... FAILED
+test kernel/src/struct_patch.rs - struct_patch::StructPatchNode (line 104) ... ignored
+test kernel/src/parallel/parallel_scan_metadata.rs - parallel::parallel_scan_metadata::ParallelState::log_metrics (line 219) - compile ... ok
+test kernel/src/snapshot/builder.rs - snapshot::builder::SnapshotBuilder (line 20) - compile ... ok
+test kernel/src/table_changes/scan_file.rs - table_changes::scan_file::visit_cdf_scan_files (line 94) ... ignored
+test kernel/src/scan/mod.rs - scan::Scan::parallel_scan_metadata (line 1049) - compile ... ok
+test kernel/src/transaction/builder/alter_table.rs - transaction::builder::alter_table (line 19) ... ignored
+test kernel/src/transaction/builder/create_table.rs - transaction::builder::create_table::CreateTableTransactionBuilder::with_table_properties (line 819) - compile ... ok
+test kernel/src/transaction/builder/create_table.rs - transaction::builder::create_table::CreateTableTransactionBuilder::with_data_layout (line 863) - compile ... ok
+test kernel/src/transaction/create_table.rs - transaction::create_table (line 9) - compile ... ok
+test kernel/src/transaction/create_table.rs - transaction::create_table::CreateTableTransaction (line 68) - compile ... ok
+test kernel/src/transaction/data_layout.rs - transaction::data_layout::DataLayout::clustered (line 64) ... ignored
+test kernel/src/transaction/data_layout.rs - transaction::data_layout::DataLayout::clustered (line 70) ... ignored
+test kernel/src/transaction/data_layout.rs - transaction::data_layout::DataLayout::partitioned (line 99) ... ignored
+test kernel/src/transaction/mod.rs - transaction::Transaction (line 192) ... ignored
+test kernel/src/transaction/mod.rs - transaction::Transaction<S>::stats_schema (line 904) ... ignored
+test kernel/src/transaction/create_table.rs - transaction::create_table::create_table (line 102) - compile ... ok
+test kernel/src/transaction/update.rs - transaction::update::Transaction::scan_metadata_to_engine_data (line 194) ... ignored
+test kernel/src/transaction/update.rs - transaction::update::Transaction::update_deletion_vectors (line 240) ... ignored
+test kernel/src/transaction/write_context.rs - transaction::write_context::WriteContext::new_deletion_vector_path (line 270) ... ignored
+test kernel/src/transaction/update.rs - transaction::update::Transaction::remove_files (line 151) - compile ... ok
+test kernel/src/transforms/expression.rs - transforms::expression::ExpressionTransform::Residual (line 69) - compile ... ok
+test kernel/src/transforms/mod.rs - transforms::transform_output_type (line 17) - compile ... ok
+test kernel/src/table_changes/mod.rs - table_changes::TableChanges (line 97) ... FAILED
+test kernel/src/table_changes/mod.rs - table_changes (line 4) ... FAILED
+test kernel/src/transforms/mod.rs - transforms::transform_output_type (line 35) - compile ... ok
+test kernel/src/transforms/schema.rs - transforms::schema::SchemaTransform::Residual (line 63) - compile ... ok
+test kernel/src/utils.rs - utils::CollectInto (line 38) ... ok
+test kernel/src/utils.rs - utils::CollectInto (line 27) ... ok
+test kernel/src/metrics/mod.rs - metrics::WithMetricsReporterLayer::with_metrics_reporter_layer (line 120) ... ok
+test kernel/src/schema/mod.rs - schema::StructFieldIntoIter (line 1354) ... ok
+test kernel/src/schema/mod.rs - schema::StructFieldRefIter (line 1428) ... ok
+test kernel/src/table_changes/scan.rs - table_changes::scan::TableChangesScanBuilder (line 44) ... ok
+
+failures:
+
+---- kernel/src/commit_range/mod.rs - commit_range (line 19) stdout ----
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
+ --> kernel/src/commit_range/mod.rs:21:5
+  |
+4 | use delta_kernel::commit_range::{CommitRange, DeltaAction};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
+ --> kernel/src/commit_range/mod.rs:23:5
+  |
+6 | use delta_kernel::object_store::local::LocalFileSystem;
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `delta_kernel`
+ --> kernel/src/commit_range/mod.rs:22:5
+  |
+5 | use delta_kernel::{Engine, Error, Snapshot};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error: aborting due to 3 previous errors
+
+Some errors have detailed explanations: E0432, E0433.
+For more information about an error, try `rustc --explain E0432`.
+Couldn't compile the test.
+---- kernel/src/schema/mod.rs - schema::schema (line 85) stdout ----
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
+ --> kernel/src/schema/mod.rs:86:5
+  |
+3 | use delta_kernel::schema::{schema, DataType, StructField};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0433`.
+Couldn't compile the test.
+---- kernel/src/schema/mod.rs - schema::schema (line 68) stdout ----
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
+ --> kernel/src/schema/mod.rs:69:5
+  |
+3 | use delta_kernel::schema::{schema, DataType, StructField, StructType};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0433`.
+Couldn't compile the test.
+---- kernel/src/table_changes/mod.rs - table_changes::TableChanges (line 97) stdout ----
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
+ --> kernel/src/table_changes/mod.rs:98:5
+  |
+3 | use delta_kernel::engine::default::{storage::store_from_url, DefaultEngineBuilder};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
+ --> kernel/src/table_changes/mod.rs:101:5
+  |
+6 | use delta_kernel::table_changes::TableChanges;
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `delta_kernel`
+ --> kernel/src/table_changes/mod.rs:100:5
+  |
+5 | use delta_kernel::{SnapshotRef, Error};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
+ --> kernel/src/table_changes/mod.rs:103:11
+  |
+8 | let url = delta_kernel::try_parse_uri(path)?;
+  |           ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error: aborting due to 4 previous errors
+
+Some errors have detailed explanations: E0432, E0433.
+For more information about an error, try `rustc --explain E0432`.
+Couldn't compile the test.
+---- kernel/src/table_changes/mod.rs - table_changes (line 4) stdout ----
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
+ --> kernel/src/table_changes/mod.rs:7:5
+  |
+5 | use delta_kernel::expressions::{column_expr, Scalar};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
+ --> kernel/src/table_changes/mod.rs:9:5
+  |
+7 | use delta_kernel::table_changes::TableChanges;
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `delta_kernel`
+ --> kernel/src/table_changes/mod.rs:8:5
+  |
+6 | use delta_kernel::{Predicate, Snapshot, SnapshotRef, Error, Engine};
+  |     ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
+ --> kernel/src/table_changes/mod.rs:11:11
+  |
+9 | let url = delta_kernel::try_parse_uri(path)?;
+  |           ^^^^^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
+  |
+  = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
+
+error: aborting due to 4 previous errors
+
+Some errors have detailed explanations: E0432, E0433.
+For more information about an error, try `rustc --explain E0432`.
+Couldn't compile the test.
+
+failures:
+    kernel/src/commit_range/mod.rs - commit_range (line 19)
+    kernel/src/schema/mod.rs - schema::schema (line 68)
+    kernel/src/schema/mod.rs - schema::schema (line 85)
+    kernel/src/table_changes/mod.rs - table_changes (line 4)
+    kernel/src/table_changes/mod.rs - table_changes::TableChanges (line 97)
+
+test result: FAILED. 56 passed; 5 failed; 34 ignored; 0 measured; 0 filtered out; finished in 58.55s
+
+error: doctest failed, to rerun pass `--doc`

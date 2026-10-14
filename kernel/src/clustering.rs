@@ -1,0 +1,410 @@
+//! Clustering column support for Delta tables.
+//!
+//! This module provides functionality for reading and writing clustering columns
+//! via domain metadata. Per the Delta protocol, writers MUST write per-file statistics
+//! for clustering columns.
+//!
+//! Clustering columns are stored in domain metadata under the `delta.clustering` domain
+//! as a JSON object with a `clusteringColumns` field containing an array of column paths,
+//! where each path is an array of field names (to handle nested columns).
+
+use delta_kernel_derive::internal_api;
+use serde::{Deserialize, Serialize};
+
+use crate::actions::DomainMetadata;
+use crate::expressions::ColumnName;
+use crate::scan::data_skipping::stats_schema::is_skipping_eligible_datatype;
+use crate::schema::{DataType, StructType};
+use crate::{DeltaResult, Error};
+
+/// Domain metadata structure for clustering columns.
+///
+/// This is deserialized from the JSON configuration stored in the
+/// `delta.clustering` domain metadata. Each clustering column is represented
+/// as an array of field names to support nested columns.
+///
+/// The column names are physical names. If column mapping is enabled, these will be
+/// the physical column identifiers (e.g., `col-uuid`); otherwise, they match the logical names.
+///
+/// Example JSON:
+/// ```json
+/// {"clusteringColumns": [["col1"], ["user", "address", "city"]]}
+/// ```
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusteringDomainMetadata {
+    clustering_columns: Vec<Vec<String>>,
+}
+
+/// The domain name for clustering metadata.
+pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
+
+/// A resolved descriptor for one clustering column on a snapshot.
+///
+/// Pairs the physical column reference (as stored in the `delta.clustering` domain) with the
+/// logical reference resolved against the snapshot's schema, plus the data type at that path.
+/// The two references differ only when column mapping is enabled. Both are multi-part for
+/// nested-field clustering.
+///
+/// Callers needing to correlate a clustering column with per-file statistics must use
+/// [`physical_column`]: stats are keyed on physical names.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+#[internal_api]
+pub(crate) struct ClusteringColumnInfo {
+    /// The physical column reference as stored in the `delta.clustering` domain.
+    pub physical_column: ColumnName,
+    /// The logical column reference, resolved against the snapshot's schema.
+    pub logical_column: ColumnName,
+    /// The data type of the column at the resolved path.
+    pub data_type: DataType,
+}
+
+/// Validates clustering columns against the table schema.
+///
+/// This function performs comprehensive validation of clustering columns:
+///
+/// **Structural validations:**
+/// 1. At least one column must be specified
+/// 2. No duplicate columns
+///
+/// **Schema validations:**
+/// 3. Column paths must resolve in the schema (including nested paths through structs)
+/// 4. Leaf field must have a data type eligible for statistics collection
+///
+/// Both top-level and nested columns are supported. For nested columns, all intermediate
+/// fields must be struct types and the leaf field must be a stats-eligible primitive.
+///
+/// # Errors
+///
+/// Returns an error if any validation fails.
+pub(crate) fn validate_clustering_columns(
+    schema: &StructType,
+    columns: &[ColumnName],
+) -> DeltaResult<()> {
+    use std::collections::HashSet;
+
+    // Structural validation: at least one column required
+    if columns.is_empty() {
+        return Err(Error::generic("Clustering requires at least one column"));
+    }
+
+    // Validate each column and check for duplicates
+    let mut seen = HashSet::new();
+    for col in columns {
+        if !seen.insert(col) {
+            return Err(Error::generic(format!(
+                "Duplicate clustering column: '{col}'"
+            )));
+        }
+
+        let field = schema.field_at(col)?;
+        match field.data_type() {
+            DataType::Primitive(ptype) if is_skipping_eligible_datatype(ptype) => {}
+            dt => {
+                return Err(Error::generic(format!(
+                    "Clustering column '{col}' has unsupported type '{dt}'. \
+                     Supported types: Byte, Short, Integer, Long, Float, Double, \
+                     Decimal, Date, Timestamp, TimestampNtz, TimestampNanos, TimestampNanosNtz, String"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Creates domain metadata for clustering configuration.
+///
+/// Converts the given clustering columns into the JSON format required by the Delta protocol
+/// and wraps it in a `DomainMetadata` action.
+///
+/// # Format
+///
+/// The JSON format is: `{"clusteringColumns": [["col1"], ["col2"]]}`
+/// Each column is represented as an array of path components to support nested columns.
+pub(crate) fn create_clustering_domain_metadata(columns: &[ColumnName]) -> DomainMetadata {
+    let metadata = ClusteringDomainMetadata {
+        clustering_columns: columns
+            .iter()
+            .map(|c| c.path().iter().map(|s| s.to_string()).collect())
+            .collect(),
+    };
+    // ClusteringDomainMetadata serialization cannot fail (only contains Vec<Vec<String>>)
+    #[allow(clippy::unwrap_used)]
+    let config = serde_json::to_string(&metadata).unwrap();
+
+    DomainMetadata::new(CLUSTERING_DOMAIN_NAME.to_string(), config)
+}
+
+/// Parses clustering columns from a JSON configuration string.
+///
+/// Returns `Ok(columns)` if the configuration is valid, or an error if malformed.
+pub(crate) fn parse_clustering_columns(json_str: &str) -> DeltaResult<Vec<ColumnName>> {
+    let metadata: ClusteringDomainMetadata = serde_json::from_str(json_str)?;
+    Ok(metadata
+        .clustering_columns
+        .into_iter()
+        .map(ColumnName::new)
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expressions::column_name;
+    use crate::schema::{schema, DataType, StructField};
+
+    #[rstest::rstest]
+    #[case::simple(
+        r#"{"clusteringColumns": [["col1"], ["col2"]]}"#,
+        vec![vec!["col1"], vec!["col2"]]
+    )]
+    #[case::empty(
+        r#"{"clusteringColumns": []}"#,
+        vec![]
+    )]
+    #[case::nested(
+        r#"{"clusteringColumns": [["id"], ["user", "address", "city"], ["a", "b", "c", "d", "e"]]}"#,
+        vec![vec!["id"], vec!["user", "address", "city"], vec!["a", "b", "c", "d", "e"]]
+    )]
+    #[case::special_characters(
+        r#"{"clusteringColumns": [["col.with.dot"], ["`backticks`", "nested"]]}"#,
+        vec![vec!["col.with.dot"], vec!["`backticks`", "nested"]]
+    )]
+    #[case::tolerates_unknown_fields(
+        r#"{"clusteringColumns": [["col1"]], "foo": "bar", "futureField": 123}"#,
+        vec![vec!["col1"]]
+    )]
+    fn test_parse_clustering_columns(#[case] json: &str, #[case] expected: Vec<Vec<&str>>) {
+        let columns = parse_clustering_columns(json).unwrap();
+        let expected_cols: Vec<ColumnName> = expected.into_iter().map(ColumnName::new).collect();
+        assert_eq!(columns, expected_cols);
+    }
+
+    #[test]
+    fn test_validate_clustering_columns_valid() {
+        let schema = schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
+        let columns = vec![column_name!("id")];
+        assert!(validate_clustering_columns(&schema, &columns).is_ok());
+    }
+
+    #[test]
+    fn test_validate_clustering_columns_not_found() {
+        let schema = schema! { not_null "id": INTEGER };
+        let columns = vec![column_name!("nonexistent")];
+        let result = validate_clustering_columns(&schema, &columns);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not found in schema"));
+    }
+
+    #[test]
+    fn test_validate_clustering_columns_nested_valid() {
+        let schema = schema! {
+            not_null "id": INTEGER,
+            nullable "user": {
+                nullable "name": STRING,
+                nullable "address": {
+                    nullable "city": STRING,
+                    nullable "zip": STRING,
+                },
+            },
+        };
+
+        // Nested leaf column with eligible type should succeed
+        let columns = vec![column_name!("user.address.city")];
+        assert!(validate_clustering_columns(&schema, &columns).is_ok());
+    }
+
+    #[test]
+    fn test_validate_clustering_nested_struct_leaf_rejected() {
+        let schema = schema! {
+            not_null "parent": { not_null "field": STRING },
+        };
+
+        // Clustering on an entire struct (not a leaf primitive) should fail
+        let columns = vec![column_name!("parent")];
+        let result = validate_clustering_columns(&schema, &columns);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported type"));
+    }
+
+    #[test]
+    fn test_validate_clustering_nested_intermediate_not_struct() {
+        let schema = schema! { not_null "flat_col": STRING };
+
+        // Trying to traverse into a non-struct field should fail
+        let columns = vec![column_name!("flat_col", "child")];
+        let result = validate_clustering_columns(&schema, &columns);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("is not a struct type"));
+    }
+
+    #[test]
+    fn test_validate_clustering_nested_path_not_found() {
+        let schema = schema! {
+            not_null "parent": { not_null "field": STRING },
+        };
+
+        // Nested field that doesn't exist should fail
+        let columns = vec![column_name!("parent", "nonexistent")];
+        let result = validate_clustering_columns(&schema, &columns);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not found in schema"));
+    }
+
+    #[test]
+    fn test_create_clustering_domain_metadata() {
+        let columns = vec![column_name!("col1"), column_name!("col2")];
+        let dm = create_clustering_domain_metadata(&columns);
+
+        assert_eq!(dm.domain(), CLUSTERING_DOMAIN_NAME);
+
+        // Verify roundtrip: the JSON we create should be parseable back
+        let parsed = parse_clustering_columns(dm.configuration()).unwrap();
+        assert_eq!(parsed, columns);
+    }
+
+    #[test]
+    fn test_create_and_parse_roundtrip() {
+        // Test that create and parse are inverses
+        let original = vec![
+            column_name!("id"),
+            column_name!("timestamp"),
+            column_name!("region"),
+        ];
+        let dm = create_clustering_domain_metadata(&original);
+        let parsed = parse_clustering_columns(dm.configuration()).unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_validate_clustering_columns_supported_types() {
+        // All supported primitive types
+        let schema = schema! {
+            not_null "byte_col": BYTE,
+            not_null "short_col": SHORT,
+            not_null "int_col": INTEGER,
+            not_null "long_col": LONG,
+            not_null "float_col": FLOAT,
+            not_null "double_col": DOUBLE,
+            not_null "date_col": DATE,
+            not_null "timestamp_col": TIMESTAMP,
+            not_null "timestamp_ntz_col": TIMESTAMP_NTZ,
+            not_null "string_col": STRING,
+            not_null "decimal_col": (DataType::decimal(10, 2).unwrap()),
+        };
+
+        // Each supported type should be valid for clustering
+        for field in schema.fields() {
+            let columns = vec![ColumnName::new([field.name()])];
+            assert!(
+                validate_clustering_columns(&schema, &columns).is_ok(),
+                "Type {} should be supported for clustering",
+                field.data_type()
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_clustering_columns_unsupported_primitive_types() {
+        // Boolean and Binary are primitives but not supported for clustering
+        let schema = schema! {
+            not_null "bool_col": BOOLEAN,
+            not_null "binary_col": BINARY,
+        };
+
+        for field in schema.fields() {
+            let columns = vec![ColumnName::new([field.name()])];
+            let result = validate_clustering_columns(&schema, &columns);
+            assert!(
+                result.is_err(),
+                "Type {} should NOT be supported for clustering",
+                field.data_type()
+            );
+            assert!(result.unwrap_err().to_string().contains("unsupported type"));
+        }
+    }
+
+    #[test]
+    fn test_validate_clustering_columns_complex_types_rejected() {
+        let schema = schema! {
+            not_null "struct_col": { not_null "inner": STRING },
+            not_null "array_col": [ not_null INTEGER ],
+            not_null "map_col": { STRING => not_null INTEGER },
+        };
+
+        for field in schema.fields() {
+            let columns = vec![ColumnName::new([field.name()])];
+            let result = validate_clustering_columns(&schema, &columns);
+            assert!(
+                result.is_err(),
+                "Complex type {} should NOT be supported for clustering",
+                field.data_type()
+            );
+            assert!(result.unwrap_err().to_string().contains("unsupported type"));
+        }
+    }
+
+    // Structural validation tests - parameterized with rstest
+
+    /// Test that any number of clustering columns is allowed (no protocol-imposed limit).
+    #[rstest::rstest]
+    #[case::four(4)]
+    #[case::five(5)]
+    #[case::ten(10)]
+    fn test_validate_clustering_column_count(#[case] num_columns: usize) {
+        let schema = schema! {
+            ..((0..num_columns).map(|i| StructField::not_null(format!("col{i}"), DataType::INTEGER)))
+        };
+
+        let columns: Vec<ColumnName> = (0..num_columns)
+            .map(|i| ColumnName::new([format!("col{i}")]))
+            .collect();
+
+        assert!(validate_clustering_columns(&schema, &columns).is_ok());
+    }
+
+    /// Test various structural validation error cases.
+    #[rstest::rstest]
+    #[case::empty_columns(vec![], "at least one column")]
+    #[case::duplicate_columns(vec!["id", "id"], "Duplicate clustering column")]
+    fn test_validate_clustering_structural_errors(
+        #[case] column_names: Vec<&str>,
+        #[case] expected_error: &str,
+    ) {
+        let schema = schema! { not_null "id": INTEGER };
+        let columns: Vec<ColumnName> = column_names
+            .into_iter()
+            .map(|s| ColumnName::new([s]))
+            .collect();
+
+        let result = validate_clustering_columns(&schema, &columns);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains(expected_error),
+            "Expected error containing '{expected_error}'"
+        );
+    }
+
+    #[test]
+    fn test_validate_clustering_columns_empty_name_rejected() {
+        let schema = schema! { not_null "id": INTEGER };
+        // Create a ColumnName with empty path (can't easily express in rstest case)
+        let columns: Vec<ColumnName> = vec![ColumnName::new(Vec::<String>::new())];
+        let result = validate_clustering_columns(&schema, &columns);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+}

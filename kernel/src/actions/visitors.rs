@@ -1,0 +1,1824 @@
+//! This module defines visitors that can be used to extract the various delta actions from
+//! [`crate::engine_data::EngineData`] types.
+
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
+
+use delta_kernel_derive::internal_api;
+
+use super::deletion_vector::DeletionVectorDescriptor;
+use super::*;
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::log_segment::DomainMetadataMap;
+use crate::schema::{
+    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef,
+};
+use crate::utils::require;
+use crate::{DeltaResult, Error};
+
+pub(crate) static METADATA_LEAVES: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
+
+#[derive(Default)]
+#[internal_api]
+pub(crate) struct MetadataVisitor {
+    pub(crate) metadata: Option<Metadata>,
+}
+
+impl RowVisitor for MetadataVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        METADATA_LEAVES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            if let Some(metadata) = visit_metadata_at(i, getters)? {
+                self.metadata = Some(metadata);
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SelectionVectorVisitor {
+    pub(crate) selection_vector: Vec<bool>,
+    pub(crate) num_filtered: u64,
+}
+
+/// A single non-nullable BOOL column
+impl RowVisitor for SelectionVectorVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| (vec![column_name!("output")], vec![DataType::BOOLEAN]).into());
+        NAMES_AND_TYPES.as_ref()
+    }
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 1,
+            Error::InternalError(format!(
+                "Wrong number of SelectionVectorVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            let selected: bool = getters[0].get(i, "selectionvector.output")?;
+            if !selected {
+                self.num_filtered += 1;
+            }
+            self.selection_vector.push(selected);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) static PROTOCOL_LEAVES: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| Protocol::to_schema().leaves(PROTOCOL_NAME));
+
+#[derive(Default)]
+#[internal_api]
+pub(crate) struct ProtocolVisitor {
+    pub(crate) protocol: Option<Protocol>,
+}
+
+impl RowVisitor for ProtocolVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        PROTOCOL_LEAVES.as_ref()
+    }
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            if let Some(protocol) = visit_protocol_at(i, getters)? {
+                self.protocol = Some(protocol);
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[allow(unused)]
+#[derive(Default)]
+#[internal_api]
+pub(crate) struct AddVisitor {
+    pub(crate) adds: Vec<Add>,
+}
+
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+impl AddVisitor {
+    #[internal_api]
+    fn visit_add<'a>(
+        row_index: usize,
+        path: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<Add> {
+        require!(
+            getters.len() == 15,
+            Error::InternalError(format!(
+                "Wrong number of AddVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        let partition_values: HashMap<_, _> = getters[1].get(row_index, "add.partitionValues")?;
+        let size: i64 = getters[2].get(row_index, "add.size")?;
+        let modification_time: i64 = getters[3].get(row_index, "add.modificationTime")?;
+        let data_change: bool = getters[4].get(row_index, "add.dataChange")?;
+        let stats: Option<String> = getters[5].get_opt(row_index, "add.stats")?;
+
+        // TODO(nick) extract tags if we ever need them at getters[6]
+
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
+
+        let base_row_id: Option<i64> = getters[12].get_opt(row_index, "add.base_row_id")?;
+        let default_row_commit_version: Option<i64> =
+            getters[13].get_opt(row_index, "add.default_row_commit")?;
+        let clustering_provider: Option<String> =
+            getters[14].get_opt(row_index, "add.clustering_provider")?;
+
+        Ok(Add {
+            path,
+            partition_values,
+            size,
+            modification_time,
+            data_change,
+            stats,
+            tags: None,
+            deletion_vector,
+            base_row_id,
+            default_row_commit_version,
+            clustering_provider,
+        })
+    }
+    pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| Add::to_schema().leaves(ADD_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+}
+
+impl RowVisitor for AddVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        Self::names_and_types()
+    }
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            // Since path column is required, use it to detect presence of an Add action
+            if let Some(path) = getters[0].get_opt(i, "add.path")? {
+                self.adds.push(Self::visit_add(i, path, getters)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[allow(unused)]
+#[derive(Default)]
+#[internal_api]
+pub(crate) struct RemoveVisitor {
+    pub(crate) removes: Vec<Remove>,
+}
+
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+impl RemoveVisitor {
+    #[internal_api]
+    pub(crate) fn visit_remove<'a>(
+        row_index: usize,
+        path: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<Remove> {
+        require!(
+            getters.len() == 15,
+            Error::InternalError(format!(
+                "Wrong number of RemoveVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        let deletion_timestamp: Option<i64> =
+            getters[1].get_opt(row_index, "remove.deletionTimestamp")?;
+        let data_change: bool = getters[2].get(row_index, "remove.dataChange")?;
+        let extended_file_metadata: Option<bool> =
+            getters[3].get_opt(row_index, "remove.extendedFileMetadata")?;
+
+        let partition_values: Option<HashMap<_, _>> =
+            getters[4].get_opt(row_index, "remove.partitionValues")?;
+
+        let size: Option<i64> = getters[5].get_opt(row_index, "remove.size")?;
+        let stats: Option<String> = getters[6].get_opt(row_index, "remove.stats")?;
+        // TODO(nick) tags are skipped in getters[7]
+
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..])?;
+
+        let base_row_id: Option<i64> = getters[13].get_opt(row_index, "remove.baseRowId")?;
+        let default_row_commit_version: Option<i64> =
+            getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
+
+        Ok(Remove {
+            path,
+            data_change,
+            deletion_timestamp,
+            extended_file_metadata,
+            partition_values,
+            size,
+            stats,
+            tags: None,
+            deletion_vector,
+            base_row_id,
+            default_row_commit_version,
+        })
+    }
+    pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| Remove::to_schema().leaves(REMOVE_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+}
+
+impl RowVisitor for RemoveVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        Self::names_and_types()
+    }
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            // Since path column is required, use it to detect presence of a Remove action
+            if let Some(path) = getters[0].get_opt(i, "remove.path")? {
+                self.removes.push(Self::visit_remove(i, path, getters)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[allow(unused)]
+#[derive(Default)]
+#[internal_api]
+pub(crate) struct CdcVisitor {
+    pub(crate) cdcs: Vec<Cdc>,
+}
+
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
+impl CdcVisitor {
+    #[internal_api]
+    pub(crate) fn visit_cdc<'a>(
+        row_index: usize,
+        path: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<Cdc> {
+        Ok(Cdc {
+            path,
+            partition_values: getters[1].get(row_index, "cdc.partitionValues")?,
+            size: getters[2].get(row_index, "cdc.size")?,
+            data_change: getters[3].get(row_index, "cdc.dataChange")?,
+            tags: getters[4].get_opt(row_index, "cdc.tags")?,
+        })
+    }
+}
+
+impl RowVisitor for CdcVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| Cdc::to_schema().leaves(CDC_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 5,
+            Error::InternalError(format!(
+                "Wrong number of CdcVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            // Since path column is required, use it to detect presence of a Cdc action
+            if let Some(path) = getters[0].get_opt(i, "cdc.path")? {
+                self.cdcs.push(Self::visit_cdc(i, path, getters)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) type SetTransactionMap = HashMap<String, SetTransaction>;
+
+/// Extract application transaction actions from the log into a map
+///
+/// This visitor maintains the first entry for each application id it
+/// encounters.  When a specific application id is required then
+/// `application_id` can be set. This bounds the memory required for the
+/// visitor to at most one entry and reduces the amount of processing
+/// required.
+#[derive(Default, Debug)]
+#[internal_api]
+pub(crate) struct SetTransactionVisitor {
+    pub(crate) set_transactions: SetTransactionMap,
+    pub(crate) application_id: Option<String>,
+}
+
+impl SetTransactionVisitor {
+    /// Create a new visitor. When application_id is set then bookkeeping is only for that id only
+    pub(crate) fn new(application_id: Option<String>) -> Self {
+        SetTransactionVisitor {
+            set_transactions: HashMap::default(),
+            application_id,
+        }
+    }
+
+    #[internal_api]
+    pub(crate) fn visit_txn<'a>(
+        row_index: usize,
+        app_id: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<SetTransaction> {
+        require!(
+            getters.len() == 3,
+            Error::InternalError(format!(
+                "Wrong number of SetTransactionVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        let version: i64 = getters[1].get(row_index, "txn.version")?;
+        let last_updated: Option<i64> = getters[2].get_opt(row_index, "txn.lastUpdated")?;
+        Ok(SetTransaction {
+            app_id,
+            version,
+            last_updated,
+        })
+    }
+}
+
+impl RowVisitor for SetTransactionVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| SetTransaction::to_schema().leaves(SET_TRANSACTION_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        // Assumes batches are visited in reverse order relative to the log
+        for i in 0..row_count {
+            if let Some(app_id) = getters[0].get_opt(i, "txn.appId")? {
+                // if caller requested a specific id then only visit matches
+                if self
+                    .application_id
+                    .as_ref()
+                    .is_none_or(|requested| requested.eq(&app_id))
+                {
+                    let txn = SetTransactionVisitor::visit_txn(i, app_id, getters)?;
+                    if !self.set_transactions.contains_key(&txn.app_id) {
+                        self.set_transactions.insert(txn.app_id.clone(), txn);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+#[internal_api]
+pub(crate) struct SidecarVisitor {
+    pub(crate) sidecars: Vec<Sidecar>,
+}
+
+impl SidecarVisitor {
+    #[internal_api]
+    fn visit_sidecar<'a>(
+        row_index: usize,
+        path: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<Sidecar> {
+        Ok(Sidecar {
+            path,
+            size_in_bytes: getters[1].get(row_index, "sidecar.sizeInBytes")?,
+            modification_time: getters[2].get(row_index, "sidecar.modificationTime")?,
+            tags: getters[3].get_opt(row_index, "sidecar.tags")?,
+        })
+    }
+}
+
+impl RowVisitor for SidecarVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| Sidecar::to_schema().leaves(SIDECAR_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 4,
+            Error::InternalError(format!(
+                "Wrong number of SidecarVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            // Since path column is required, use it to detect presence of a Sidecar action
+            if let Some(path) = getters[0].get_opt(i, "sidecar.path")? {
+                self.sidecars.push(Self::visit_sidecar(i, path, getters)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Visit data batches of actions to extract the latest domain metadata for each domain. Note that
+/// this will return all domains including 'removed' domains. The caller is responsible for either
+/// using or throwing away these tombstones.
+///
+/// Note that this visitor requires that the log (each actions batch) is replayed in reverse order.
+///
+/// This visitor maintains the first entry for each domain it encounters. A domain_filter may be
+/// included to only retain domain metadata for a specific set of domains (in order to bound memory
+/// requirements and enable early termination once all requested domains are found).
+#[derive(Debug, Default)]
+pub(crate) struct DomainMetadataVisitor {
+    domain_metadatas: DomainMetadataMap,
+    domain_filter: Option<HashSet<String>>,
+}
+
+impl DomainMetadataVisitor {
+    /// Create a new visitor. When domain_filter is set then we only retain domain metadata for
+    /// domains in the provided set, enabling early termination once all requested domains are
+    /// found.
+    pub(crate) fn new(domain_filter: Option<HashSet<String>>) -> Self {
+        DomainMetadataVisitor {
+            domain_filter,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn visit_domain_metadata<'a>(
+        row_index: usize,
+        domain: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<DomainMetadata> {
+        require!(
+            getters.len() == 3,
+            Error::InternalError(format!(
+                "Wrong number of DomainMetadataVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        let configuration: String = getters[1].get(row_index, "domainMetadata.configuration")?;
+        let removed: bool = getters[2].get(row_index, "domainMetadata.removed")?;
+        Ok(DomainMetadata {
+            domain,
+            configuration,
+            removed,
+        })
+    }
+
+    /// Returns true if a domain filter is set and all requested domains have been found.
+    /// This is used to enable early termination of log replay once all N requested domains
+    /// have been discovered.
+    pub(crate) fn filter_found(&self) -> bool {
+        self.domain_filter
+            .as_ref()
+            .is_some_and(|filter| self.domain_metadatas.len() == filter.len())
+    }
+
+    pub(crate) fn into_domain_metadatas(self) -> DomainMetadataMap {
+        let mut domain_metadatas = self.domain_metadatas;
+        domain_metadatas.retain(|_, dm| !dm.removed);
+        domain_metadatas
+    }
+
+    /// The newest-wins domain-metadata map, retaining tombstones (`removed == true`).
+    /// [`Self::into_domain_metadatas`] returns the same map with tombstones stripped.
+    pub(crate) fn into_domain_metadatas_including_tombstones(self) -> DomainMetadataMap {
+        self.domain_metadatas
+    }
+}
+
+impl RowVisitor for DomainMetadataVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| DomainMetadata::to_schema().leaves(DOMAIN_METADATA_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        // Requires that batches are visited in reverse order relative to the log
+        for i in 0..row_count {
+            let domain: Option<String> = getters[0].get_opt(i, "domainMetadata.domain")?;
+            if let Some(domain) = domain {
+                // if caller requested specific domains then only visit matches
+                let filter = self.domain_filter.as_ref();
+                if filter.is_none_or(|requested| requested.contains(&domain)) {
+                    // Since batches are visited newest-first, a domain already present in
+                    // domain_metadatas was found in a newer commit and takes precedence.
+                    // Use Entry::Vacant so we only read configuration/removed when the
+                    // slot is actually empty, avoiding unnecessary field access.
+                    if let Entry::Vacant(entry) = self.domain_metadatas.entry(domain.clone()) {
+                        let domain_metadata =
+                            DomainMetadataVisitor::visit_domain_metadata(i, domain, getters)?;
+                        entry.insert(domain_metadata);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Get a DV out of some engine data. The caller is responsible for slicing the `getters` slice such
+/// that the first element contains the `storageType` element of the deletion vector.
+pub(crate) fn visit_deletion_vector_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<DeletionVectorDescriptor>> {
+    let storage_type_opt: Option<String> =
+        getters[0].get_opt(row_index, "remove.deletionVector.storageType")?;
+    if let Some(storage_type_str) = storage_type_opt {
+        let storage_type = storage_type_str.parse()?;
+        let path_or_inline_dv: String =
+            getters[1].get(row_index, "deletionVector.pathOrInlineDv")?;
+        let offset: Option<i32> = getters[2].get_opt(row_index, "deletionVector.offset")?;
+        let size_in_bytes: i32 = getters[3].get(row_index, "deletionVector.sizeInBytes")?;
+        let cardinality: i64 = getters[4].get(row_index, "deletionVector.cardinality")?;
+        Ok(Some(DeletionVectorDescriptor {
+            storage_type,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Get a Metadata out of some engine data. Note that Ok(None) is returned if there is no Metadata
+/// found. The caller is responsible for slicing the `getters` slice such that the first element
+/// contains the `id` element of the metadata.
+#[internal_api]
+pub(crate) fn visit_metadata_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<Metadata>> {
+    require!(
+        getters.len() == 9,
+        Error::InternalError(format!(
+            "Wrong number of MetadataVisitor getters: {}",
+            getters.len()
+        ))
+    );
+
+    // Since id column is required, use it to detect presence of a metadata action
+    let Some(id) = getters[0].get_opt(row_index, "metadata.id")? else {
+        return Ok(None);
+    };
+
+    let name: Option<String> = getters[1].get_opt(row_index, "metadata.name")?;
+    let description: Option<String> = getters[2].get_opt(row_index, "metadata.description")?;
+    // get format out of primitives
+    let format_provider: String = getters[3].get(row_index, "metadata.format.provider")?;
+    // options for format is always empty, so skip getters[4]
+    let schema_string: String = getters[5].get(row_index, "metadata.schema_string")?;
+    let partition_columns: Vec<_> = getters[6].get(row_index, "metadata.partition_list")?;
+    let created_time: Option<i64> = getters[7].get_opt(row_index, "metadata.created_time")?;
+    let configuration_map_opt: Option<HashMap<_, _>> =
+        getters[8].get_opt(row_index, "metadata.configuration")?;
+    let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
+
+    Ok(Some(Metadata {
+        id,
+        name,
+        description,
+        format: Format {
+            provider: format_provider,
+            options: HashMap::new(),
+        },
+        schema_string,
+        partition_columns,
+        created_time,
+        configuration,
+    }))
+}
+
+/// Get a Protocol out of some engine data. Note that Ok(None) is returned if there is no Protocol
+/// found. The caller is responsible for slicing the `getters` slice such that the first element
+/// contains the `min_reader_version` element of the protocol.
+#[internal_api]
+pub(crate) fn visit_protocol_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<Protocol>> {
+    require!(
+        getters.len() == 4,
+        Error::InternalError(format!(
+            "Wrong number of ProtocolVisitor getters: {}",
+            getters.len()
+        ))
+    );
+    // Since minReaderVersion column is required, use it to detect presence of a Protocol action
+    let Some(min_reader_version) = getters[0].get_opt(row_index, "protocol.min_reader_version")?
+    else {
+        return Ok(None);
+    };
+    let min_writer_version: i32 = getters[1].get(row_index, "protocol.min_writer_version")?;
+    let reader_features: Option<Vec<_>> =
+        getters[2].get_opt(row_index, "protocol.reader_features")?;
+    let writer_features: Option<Vec<_>> =
+        getters[3].get_opt(row_index, "protocol.writer_features")?;
+
+    let protocol = Protocol::try_new(
+        min_reader_version,
+        min_writer_version,
+        reader_features,
+        writer_features,
+    )?;
+    Ok(Some(protocol))
+}
+
+/// This visitor extracts the in-commit timestamp (ICT) from a CommitInfo action in the log it is
+/// present. The [`EngineData`] being visited must have the schema defined in
+/// [`InCommitTimestampVisitor::schema`].
+///
+/// Only the a single row of the engine data is checked (the first row). This is because in-commit
+/// timestamps requires that the CommitInfo containing the ICT be the first action in the log.
+#[allow(unused)]
+#[derive(Default)]
+pub(crate) struct InCommitTimestampVisitor {
+    pub(crate) in_commit_timestamp: Option<i64>,
+}
+
+impl InCommitTimestampVisitor {
+    #[allow(unused)]
+    /// Get the schema that the visitor expects the data to have.
+    pub(crate) fn schema() -> Arc<Schema> {
+        static SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+            nullable COMMIT_INFO_NAME: {
+                nullable "inCommitTimestamp": LONG,
+            },
+        };
+        SCHEMA.clone()
+    }
+}
+impl RowVisitor for InCommitTimestampVisitor {
+    fn selected_column_names_and_types(
+        &self,
+    ) -> (&'static [crate::schema::ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            let names = vec![column_name!("commitInfo.inCommitTimestamp")];
+            let types = vec![DataType::LONG];
+
+            (names, types).into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(
+        &mut self,
+        row_count: usize,
+        getters: &[&'a dyn crate::engine_data::GetData<'a>],
+    ) -> DeltaResult<()> {
+        require!(
+            getters.len() == 1,
+            Error::InternalError(format!(
+                "Wrong number of InCommitTimestampVisitor getters: {}",
+                getters.len()
+            ))
+        );
+
+        // If the batch is empty, return
+        if row_count == 0 {
+            return Ok(());
+        }
+        // CommitInfo must be the first action in a commit
+        if let Some(in_commit_timestamp) = getters[0].get_long(0, "commitInfo.inCommitTimestamp")? {
+            self.in_commit_timestamp = Some(in_commit_timestamp);
+        }
+        Ok(())
+    }
+}
+
+// === Checkpoint action (adaptiveMetadata) ===
+
+/// Extracts the first `checkpoint` action found, leaving `checkpoint` as `None` if a batch has
+/// none. The action is an array of single-key tagged objects, each one of the metadata actions
+/// embedded in an adaptiveMetadata manifest commit.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Default)]
+#[internal_api]
+pub(crate) struct CheckpointVisitor {
+    pub(crate) checkpoint: Option<CheckpointAction>,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl RowVisitor for CheckpointVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![ColumnName::new([CHECKPOINT_ACTION_NAME])],
+                vec![CHECKPOINT_ACTION_FIELD.data_type.clone()],
+            )
+                .into()
+        });
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 1,
+            Error::InternalError(format!(
+                "Wrong number of CheckpointVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            if let Some(elements) = getters[0].get_struct_list(i, CHECKPOINT_ACTION_NAME)? {
+                let mut element_visitor = CheckpointElementVisitor::default();
+                elements.visit_with(&mut element_visitor)?;
+                self.checkpoint = Some(element_visitor.into_checkpoint_action()?);
+                // Keep the first checkpoint row found; this only extracts one action, it is not
+                // the RFC's checkpoint selection rule (MAX checkpointMetadata.version across
+                // commits, standalone checkpoints, and _last_checkpoint).
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Getter sub-ranges within the flattened element-union schema, one per element variant. The
+/// element schema concatenates each variant's leaves in a fixed order, so a variant's leaves are
+/// always a contiguous slice of the getters.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Default)]
+struct CheckpointElementRanges {
+    checkpoint_metadata: std::ops::Range<usize>,
+    content_root: std::ops::Range<usize>,
+    protocol: std::ops::Range<usize>,
+    metadata: std::ops::Range<usize>,
+    domain_metadata: std::ops::Range<usize>,
+    txn: std::ops::Range<usize>,
+    /// Index of the sidecar element's leading `type` leaf.
+    sidecar_type: usize,
+    /// The [`Sidecar`] leaves following `type` (`path`, `sizeInBytes`, ...).
+    sidecar: std::ops::Range<usize>,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+static CHECKPOINT_ELEMENT_RANGES: LazyLock<CheckpointElementRanges> = LazyLock::new(|| {
+    // Walk CHECKPOINT_ACTION_ELEMENT_SCHEMA itself, sizing each range by that field's leaf count,
+    // so the ranges cannot drift from the schema they index into.
+    let mut r = CheckpointElementRanges::default();
+    let mut next = 0;
+    for field in CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields() {
+        let leaf_count = match field.data_type() {
+            DataType::Struct(inner) => inner.leaves(None).as_ref().0.len(),
+            _ => 0,
+        };
+        let range = next..next + leaf_count;
+        next += leaf_count;
+        match field.name().as_str() {
+            CHECKPOINT_METADATA_NAME => r.checkpoint_metadata = range,
+            CONTENT_ROOT_NAME => r.content_root = range,
+            PROTOCOL_NAME => r.protocol = range,
+            METADATA_NAME => r.metadata = range,
+            DOMAIN_METADATA_NAME => r.domain_metadata = range,
+            SET_TRANSACTION_NAME => r.txn = range,
+            // The sidecar element is a leading `type` leaf followed by the Sidecar leaves.
+            SIDECAR_NAME => {
+                r.sidecar_type = range.start;
+                r.sidecar = (range.start + 1)..range.end;
+            }
+            _ => {}
+        }
+    }
+    // Every checkpoint element field is a struct with >= 1 leaf, so every range must have been
+    // populated by the match above. A 0..0 range means a name in the match drifted from
+    // CHECKPOINT_ACTION_ELEMENT_SCHEMA and would silently alias field 0's getter.
+    debug_assert!(
+        !r.checkpoint_metadata.is_empty()
+            && !r.content_root.is_empty()
+            && !r.protocol.is_empty()
+            && !r.metadata.is_empty()
+            && !r.domain_metadata.is_empty()
+            && !r.txn.is_empty()
+            && r.sidecar_type > 0
+            && !r.sidecar.is_empty(),
+        "CHECKPOINT_ELEMENT_RANGES: a checkpoint element field name did not match a known variant \
+         (schema/constant drift)"
+    );
+    r
+});
+
+/// Inner visitor over the element structs of a `checkpoint` array, collecting each element into
+/// the field it belongs to. Sidecars are split into `txn` vs `domainMetadata` by their `type`.
+///
+/// Parsing is order-insensitive: the RFC imposes no element order, so the order kernel writes is
+/// only a convention.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Default)]
+struct CheckpointElementVisitor {
+    version: Option<i64>,
+    content_root: Option<ContentRoot>,
+    protocol: Option<Protocol>,
+    metadata: Option<Metadata>,
+    transactions: Vec<SetTransaction>,
+    domain_metadata: Vec<DomainMetadata>,
+    txn_sidecars: Vec<Sidecar>,
+    domain_metadata_sidecars: Vec<Sidecar>,
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl CheckpointElementVisitor {
+    /// Assemble the visited elements into a [`CheckpointAction`], erroring if a required element
+    /// was absent or if [`CheckpointAction::validate`] rejects the assembled action.
+    fn into_checkpoint_action(self) -> DeltaResult<CheckpointAction> {
+        let missing = |field: &str| {
+            Error::generic(format!(
+                "checkpoint action is missing required `{field}` element"
+            ))
+        };
+        let action = CheckpointAction {
+            version: self.version.ok_or_else(|| missing("checkpointMetadata"))?,
+            content_root: self.content_root.ok_or_else(|| missing("contentRoot"))?,
+            protocol: self.protocol.ok_or_else(|| missing("protocol"))?,
+            metadata: self.metadata.ok_or_else(|| missing("metaData"))?,
+            transactions: self.transactions,
+            domain_metadata: self.domain_metadata,
+            txn_sidecars: self.txn_sidecars,
+            domain_metadata_sidecars: self.domain_metadata_sidecars,
+        };
+        action.validate()?;
+        Ok(action)
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl RowVisitor for CheckpointElementVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| CHECKPOINT_ACTION_ELEMENT_SCHEMA.leaves(None));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        let r = &*CHECKPOINT_ELEMENT_RANGES;
+        for i in 0..row_count {
+            // Each element is a single-key tagged object, so at most one variant has a non-null
+            // required leaf. Probe each variant's required leaf in turn to identify it. An element
+            // matching none of them is a variant added by a newer writer; skip it for forward
+            // compatibility rather than failing the whole action.
+            if let Some(version) =
+                getters[r.checkpoint_metadata.start].get_opt(i, "checkpointMetadata.version")?
+            {
+                set_once(&mut self.version, version, "checkpointMetadata")?;
+            } else if let Some(content_root) =
+                visit_content_root_at(i, &getters[r.content_root.clone()])?
+            {
+                set_once(&mut self.content_root, content_root, "contentRoot")?;
+            } else if let Some(protocol) = visit_protocol_at(i, &getters[r.protocol.clone()])? {
+                set_once(&mut self.protocol, protocol, "protocol")?;
+            } else if let Some(metadata) = visit_metadata_at(i, &getters[r.metadata.clone()])? {
+                set_once(&mut self.metadata, metadata, "metaData")?;
+            } else if let Some(domain) =
+                getters[r.domain_metadata.start].get_opt(i, "domainMetadata.domain")?
+            {
+                self.domain_metadata
+                    .push(DomainMetadataVisitor::visit_domain_metadata(
+                        i,
+                        domain,
+                        &getters[r.domain_metadata.clone()],
+                    )?);
+            } else if let Some(app_id) = getters[r.txn.start].get_opt(i, "txn.appId")? {
+                self.transactions.push(SetTransactionVisitor::visit_txn(
+                    i,
+                    app_id,
+                    &getters[r.txn.clone()],
+                )?);
+            } else if let Some(path) = getters[r.sidecar.start].get_opt(i, "sidecar.path")? {
+                let sidecar = SidecarVisitor::visit_sidecar(i, path, &getters[r.sidecar.clone()])?;
+                let sidecar_type: String = getters[r.sidecar_type].get(i, "sidecar.type")?;
+                match sidecar_type.as_str() {
+                    SET_TRANSACTION_NAME => self.txn_sidecars.push(sidecar),
+                    DOMAIN_METADATA_NAME => self.domain_metadata_sidecars.push(sidecar),
+                    other => {
+                        return Err(Error::generic(format!(
+                            "checkpoint sidecar has unsupported type `{other}`"
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Store `value` in `slot`, erroring if it was already occupied. Checkpoint elements named by
+/// `name` are singletons, so a second occurrence is malformed rather than an override.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> DeltaResult<()> {
+    if slot.replace(value).is_some() {
+        return Err(Error::generic(format!(
+            "duplicate `{name}` element in checkpoint action"
+        )));
+    }
+    Ok(())
+}
+
+/// Get a [`ContentRoot`] out of engine data. Returns `Ok(None)` when the (required) `path` leaf is
+/// null. The caller slices `getters` so the first element is `contentRoot.path`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn visit_content_root_at<'a>(
+    row_index: usize,
+    getters: &[&'a dyn GetData<'a>],
+) -> DeltaResult<Option<ContentRoot>> {
+    let Some(path) = getters[0].get_opt(row_index, "contentRoot.path")? else {
+        return Ok(None);
+    };
+    Ok(Some(ContentRoot {
+        path,
+        size_in_bytes: getters[1].get(row_index, "contentRoot.sizeInBytes")?,
+        version: getters[2].get(row_index, "contentRoot.version")?,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::actions::LOG_CHECKPOINT_SCHEMA;
+    use crate::arrow::array::{BooleanArray, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::sync::SyncEngine;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::engine::to_json_bytes;
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    use crate::engine_data::FilteredEngineData;
+    use crate::expressions::{column_expr_ref, Expression};
+    use crate::table_features::TableFeature;
+    use crate::unit_test_utils::{action_batch, parse_json_batch};
+    use crate::Engine;
+
+    #[test]
+    fn test_parse_protocol() -> DeltaResult<()> {
+        let data = action_batch();
+        let parsed = Protocol::try_new_from_data(data.as_ref())?.unwrap();
+        let expected = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(vec![TableFeature::DeletionVectors]),
+            writer_features: Some(vec![TableFeature::DeletionVectors]),
+        };
+        assert_eq!(parsed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_cdc() -> DeltaResult<()> {
+        let data = action_batch();
+        let mut visitor = CdcVisitor::default();
+        visitor.visit_rows_of(data.as_ref())?;
+        let expected = Cdc {
+            path: "_change_data/age=21/cdc-00000-93f7fceb-281a-446a-b221-07b88132d203.c000.snappy.parquet".into(),
+            partition_values: HashMap::from([
+                ("age".to_string(), "21".to_string()),
+            ]),
+            size: 1033,
+            data_change: false,
+            tags: None
+        };
+
+        assert_eq!(&visitor.cdcs, &[expected]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_sidecar() -> DeltaResult<()> {
+        let data = action_batch();
+
+        let mut visitor = SidecarVisitor::default();
+        visitor.visit_rows_of(data.as_ref())?;
+
+        let sidecar1 = Sidecar {
+            path: "016ae953-37a9-438e-8683-9a9a4a79a395.parquet".into(),
+            size_in_bytes: 9268,
+            modification_time: 1714496113961,
+            tags: Some(HashMap::from([(
+                "tag_foo".to_string(),
+                "tag_bar".to_string(),
+            )])),
+        };
+
+        assert_eq!(visitor.sidecars.len(), 1);
+        assert_eq!(visitor.sidecars[0], sidecar1);
+
+        Ok(())
+    }
+
+    // `None` exercises the typed-null map arm; `Some` exercises the present-map arm of the
+    // `Option<HashMap<..>>` -> `Scalar` conversion end-to-end, round-tripping back through
+    // `MapItem::materialize` (the visitor reads `sidecar.tags` back).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    #[case::no_tags(None)]
+    #[case::with_tags(Some(HashMap::from([("k".to_string(), "v".to_string())])))]
+    fn test_checkpoint_action_write_then_read_round_trip(
+        #[case] sidecar_tags: Option<HashMap<String, String>>,
+    ) -> DeltaResult<()> {
+        let action = CheckpointAction {
+            version: 7,
+            content_root: ContentRoot {
+                path: "s3://bucket/manifest".to_string(),
+                size_in_bytes: 512,
+                version: 5,
+            },
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            metadata: Metadata::default(),
+            transactions: vec![SetTransaction {
+                app_id: "app".to_string(),
+                version: 1,
+                last_updated: None,
+            }],
+            domain_metadata: vec![DomainMetadata {
+                domain: "d".to_string(),
+                configuration: "c".to_string(),
+                removed: false,
+            }],
+            txn_sidecars: vec![Sidecar {
+                path: "txn.parquet".to_string(),
+                size_in_bytes: 1,
+                modification_time: 2,
+                tags: sidecar_tags,
+            }],
+            domain_metadata_sidecars: vec![],
+        };
+
+        // Round-trip through the engine JSON writer and reader: build engine data, serialize it to
+        // a commit line with `to_json_bytes`, then parse it back and reconstruct the action.
+        let engine = SyncEngine::new();
+        let data = action
+            .clone()
+            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let bytes = to_json_bytes(std::iter::once(Ok(
+            FilteredEngineData::with_all_rows_selected(data),
+        )))?;
+        let commit_json = String::from_utf8(bytes).unwrap();
+
+        let data = parse_json_batch(StringArray::from(vec![commit_json]));
+        let parsed = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should round-trip through the log");
+        assert_eq!(parsed, action);
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_parse_checkpoint_action() -> DeltaResult<()> {
+        use crate::unit_test_utils::checkpoint_action_batch;
+
+        let data = checkpoint_action_batch();
+        let checkpoint = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should be present");
+
+        assert_eq!(checkpoint.version, 42);
+        assert_eq!(checkpoint.content_root.path, "s3://bucket/manifest");
+        assert_eq!(checkpoint.protocol.min_reader_version, 3);
+        assert_eq!(
+            checkpoint.protocol.reader_features(),
+            Some([TableFeature::AdaptiveMetadataPreview].as_slice())
+        );
+        assert_eq!(
+            checkpoint.protocol.writer_features(),
+            Some([TableFeature::AdaptiveMetadataPreview].as_slice())
+        );
+        assert_eq!(checkpoint.metadata.id, "testId");
+        assert_eq!(
+            checkpoint.transactions,
+            vec![SetTransaction {
+                app_id: "myApp".into(),
+                version: 3,
+                last_updated: None,
+            }]
+        );
+        assert_eq!(
+            checkpoint.domain_metadata,
+            vec![DomainMetadata {
+                domain: "myDomain".into(),
+                configuration: "cfg".into(),
+                removed: false,
+            }]
+        );
+        assert_eq!(checkpoint.txn_sidecars.len(), 1);
+        assert_eq!(checkpoint.txn_sidecars[0].path, "txn-sidecar.parquet");
+        assert_eq!(checkpoint.domain_metadata_sidecars.len(), 1);
+        assert_eq!(
+            checkpoint.domain_metadata_sidecars[0].path,
+            "dm-sidecar.parquet"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_parse_checkpoint_action_first_row_wins() -> DeltaResult<()> {
+        use crate::unit_test_utils::parse_json_batch;
+
+        let element = |version: i64| {
+            format!(
+                r#"{{"checkpoint":[{{"checkpointMetadata":{{"version":{version}}}}},{{"contentRoot":{{"path":"p","sizeInBytes":1,"version":{version}}}}},{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}},{{"metaData":{{"id":"id{version}","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":[]}}","partitionColumns":[],"configuration":{{}}}}}}]}}"#
+            )
+        };
+        let data = parse_json_batch(StringArray::from(vec![element(1), element(2)]));
+        let checkpoint = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should be present");
+        assert_eq!(checkpoint.version, 1);
+        assert_eq!(checkpoint.metadata.id, "id1");
+        Ok(())
+    }
+
+    /// Fully-populated checkpoint array elements, used to build valid and malformed variants.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    mod checkpoint_elements {
+        pub(super) const CHECKPOINT_METADATA: &str = r#"{"checkpointMetadata":{"version":42}}"#;
+        pub(super) const CONTENT_ROOT: &str =
+            r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":40}}"#;
+        pub(super) const PROTOCOL: &str =
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+        pub(super) const METADATA: &str = r#"{"metaData":{"id":"id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[]}","partitionColumns":[],"configuration":{}}}"#;
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn checkpoint_commit(elements: &[&str]) -> Box<dyn crate::EngineData> {
+        use crate::unit_test_utils::parse_json_batch;
+        let commit = format!(r#"{{"checkpoint":[{}]}}"#, elements.join(","));
+        parse_json_batch(StringArray::from(vec![commit]))
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest::rstest]
+    // A repeated singleton element is malformed, not an override.
+    #[case::duplicate_metadata(&[
+        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
+        checkpoint_elements::PROTOCOL, checkpoint_elements::METADATA, checkpoint_elements::METADATA,
+    ], "duplicate `metaData` element in checkpoint action")]
+    #[case::duplicate_checkpoint_metadata(&[
+        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CHECKPOINT_METADATA,
+        checkpoint_elements::CONTENT_ROOT, checkpoint_elements::PROTOCOL,
+        checkpoint_elements::METADATA,
+    ], "duplicate `checkpointMetadata` element in checkpoint action")]
+    // Missing a required element.
+    #[case::missing_protocol(&[
+        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
+        checkpoint_elements::METADATA,
+    ], "checkpoint action is missing required `protocol` element")]
+    #[case::missing_content_root(&[
+        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::PROTOCOL,
+        checkpoint_elements::METADATA,
+    ], "checkpoint action is missing required `contentRoot` element")]
+    #[case::missing_metadata(&[
+        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
+        checkpoint_elements::PROTOCOL,
+    ], "checkpoint action is missing required `metaData` element")]
+    // Empty `checkpoint: []` array -> the first required element checked (checkpointMetadata) is
+    // reported missing.
+    #[case::empty_array(&[], "checkpoint action is missing required `checkpointMetadata` element")]
+    // Unsupported sidecar `type`.
+    #[case::bad_sidecar_type(&[
+        checkpoint_elements::CHECKPOINT_METADATA, checkpoint_elements::CONTENT_ROOT,
+        checkpoint_elements::PROTOCOL, checkpoint_elements::METADATA,
+        r#"{"sidecar":{"type":"bogus","path":"s.parquet","sizeInBytes":1,"modificationTime":0}}"#,
+    ], "checkpoint sidecar has unsupported type `bogus`")]
+    // contentRoot.version must be <= checkpointMetadata.version.
+    #[case::content_root_version_too_high(&[
+        checkpoint_elements::CHECKPOINT_METADATA,
+        r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":99}}"#,
+        checkpoint_elements::PROTOCOL, checkpoint_elements::METADATA,
+    ], "checkpoint contentRoot.version 99 exceeds checkpointMetadata.version 42")]
+    fn test_parse_checkpoint_action_errors(#[case] elements: &[&str], #[case] expected_msg: &str) {
+        let err = CheckpointAction::try_new_from_data(checkpoint_commit(elements).as_ref())
+            .expect_err("checkpoint action should fail to parse");
+        assert!(
+            err.to_string().contains(expected_msg),
+            "expected error containing {expected_msg:?}, got: {err}"
+        );
+    }
+
+    /// An element whose variant kernel does not know -- written by a newer writer -- must be
+    /// skipped rather than failing the surrounding action.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_parse_checkpoint_action_skips_unknown_element_variant() -> DeltaResult<()> {
+        let data = checkpoint_commit(&[
+            checkpoint_elements::CHECKPOINT_METADATA,
+            checkpoint_elements::CONTENT_ROOT,
+            checkpoint_elements::PROTOCOL,
+            checkpoint_elements::METADATA,
+            r#"{"somethingNew":{"path":"a","size":1}}"#,
+        ]);
+        let checkpoint = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should be present");
+        assert_eq!(checkpoint.version, 42);
+        assert!(checkpoint.transactions.is_empty());
+        assert!(checkpoint.domain_metadata.is_empty());
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_parse_checkpoint_action_minimal_round_trip() -> DeltaResult<()> {
+        let data = checkpoint_commit(&[
+            checkpoint_elements::CHECKPOINT_METADATA,
+            checkpoint_elements::CONTENT_ROOT,
+            checkpoint_elements::PROTOCOL,
+            checkpoint_elements::METADATA,
+        ]);
+        let checkpoint = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should be present");
+        assert_eq!(checkpoint.version, 42);
+        assert!(checkpoint.transactions.is_empty());
+        assert!(checkpoint.domain_metadata.is_empty());
+        assert!(checkpoint.txn_sidecars.is_empty());
+        assert!(checkpoint.domain_metadata_sidecars.is_empty());
+        Ok(())
+    }
+
+    /// `contentRoot.version == checkpointMetadata.version` is the boundary of the `<=` invariant
+    /// and must parse successfully (the error rstest covers only `<` and `>`).
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_parse_checkpoint_action_content_root_version_equal_is_ok() -> DeltaResult<()> {
+        let data = checkpoint_commit(&[
+            checkpoint_elements::CHECKPOINT_METADATA,
+            r#"{"contentRoot":{"path":"p","sizeInBytes":1,"version":42}}"#,
+            checkpoint_elements::PROTOCOL,
+            checkpoint_elements::METADATA,
+        ]);
+        let checkpoint = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should be present");
+        assert_eq!(checkpoint.version, 42);
+        assert_eq!(checkpoint.content_root.version, 42);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_metadata() -> DeltaResult<()> {
+        let data = action_batch();
+        let parsed = Metadata::try_new_from_data(data.as_ref())?.unwrap();
+
+        use crate::table_properties::{
+            COLUMN_MAPPING_MODE, ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS,
+        };
+
+        let configuration = HashMap::from_iter([
+            (ENABLE_DELETION_VECTORS.to_string(), "true".to_string()),
+            (COLUMN_MAPPING_MODE.to_string(), "none".to_string()),
+            (ENABLE_CHANGE_DATA_FEED.to_string(), "true".to_string()),
+        ]);
+        let expected = Metadata {
+            id: "testId".into(),
+            name: None,
+            description: None,
+            format: Format {
+                provider: "parquet".into(),
+                options: Default::default(),
+            },
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            partition_columns: Vec::new(),
+            created_time: Some(1677811175819),
+            configuration,
+        };
+        assert_eq!(parsed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_add_partitioned() {
+        let json_strings: StringArray = vec![
+            r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"add":{"path":"c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","partitionValues":{"c1":"4","c2":"c"},"size":452,"modificationTime":1670892998135,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}"}}"#,
+            r#"{"add":{"path":"c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet","partitionValues":{"c1":"5","c2":"b"},"size":452,"modificationTime":1670892998136,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":6},\"maxValues\":{\"c3\":6},\"nullCount\":{\"c3\":0}}"}}"#,
+            r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+        let mut add_visitor = AddVisitor::default();
+        add_visitor.visit_rows_of(batch.as_ref()).unwrap();
+        let add1 = Add {
+            path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet".into(),
+            partition_values: HashMap::from([
+                ("c1".to_string(), "4".to_string()),
+                ("c2".to_string(), "c".to_string()),
+            ]),
+            size: 452,
+            modification_time: 1670892998135,
+            data_change: true,
+            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":5},\"maxValues\":{\"c3\":5},\"nullCount\":{\"c3\":0}}".into()),
+            ..Default::default()
+        };
+        let add2 = Add {
+            path: "c1=5/c2=b/part-00007-4e73fa3b-2c88-424a-8051-f8b54328ffdb.c000.snappy.parquet".into(),
+            partition_values: HashMap::from([
+                ("c1".to_string(), "5".to_string()),
+                ("c2".to_string(), "b".to_string()),
+            ]),
+            modification_time: 1670892998136,
+            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":6},\"maxValues\":{\"c3\":6},\"nullCount\":{\"c3\":0}}".into()),
+            ..add1.clone()
+        };
+        let add3 = Add {
+            path: "c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet".into(),
+            partition_values: HashMap::from([
+                ("c1".to_string(), "6".to_string()),
+                ("c2".to_string(), "a".to_string()),
+            ]),
+            modification_time: 1670892998137,
+            stats: Some("{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}".into()),
+            ..add1.clone()
+        };
+        let expected = vec![add1, add2, add3];
+        assert_eq!(add_visitor.adds.len(), expected.len());
+        for (add, expected) in add_visitor.adds.into_iter().zip(expected) {
+            assert_eq!(add, expected);
+        }
+    }
+
+    #[test]
+    fn test_parse_remove_partitioned() {
+        let json_strings: StringArray = vec![
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"remove":{"path":"c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"partitionValues":{"c1":"4","c2":"c"},"size":452,"stats":"{\"numRecords\":1}"}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+        let mut remove_visitor = RemoveVisitor::default();
+        remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
+        let expected_remove = Remove {
+            path: "c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet"
+                .into(),
+            deletion_timestamp: Some(1670892998135),
+            data_change: true,
+            partition_values: Some(HashMap::from([
+                ("c1".to_string(), "4".to_string()),
+                ("c2".to_string(), "c".to_string()),
+            ])),
+            size: Some(452),
+            stats: Some(r#"{"numRecords":1}"#.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            remove_visitor.removes.len(),
+            1,
+            "Unexpected number of remove actions"
+        );
+        assert_eq!(
+            remove_visitor.removes[0], expected_remove,
+            "Unexpected remove action"
+        );
+    }
+
+    #[test]
+    fn test_parse_remove_all_fields_unique() {
+        // This test verifies that all fields in the Remove action are correctly parsed
+        // and that each field gets a unique value, ensuring no index collisions
+        let json_strings: StringArray = vec![
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"remove":{"path":"test-path.parquet","deletionTimestamp":1234567890,"dataChange":false,"extendedFileMetadata":true,"partitionValues":{"part":"value"},"size":9999,"stats":"{\"numRecords\":42}","deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":3},"baseRowId":100,"defaultRowCommitVersion":5}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+        let mut remove_visitor = RemoveVisitor::default();
+        remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
+
+        assert_eq!(
+            remove_visitor.removes.len(),
+            1,
+            "Expected exactly one remove action"
+        );
+
+        let remove = &remove_visitor.removes[0];
+
+        // Verify each field has the expected unique value
+        assert_eq!(remove.path, "test-path.parquet", "path mismatch");
+        assert_eq!(
+            remove.deletion_timestamp,
+            Some(1234567890),
+            "deletion_timestamp mismatch"
+        );
+        assert!(!remove.data_change, "data_change mismatch");
+        assert_eq!(
+            remove.extended_file_metadata,
+            Some(true),
+            "extended_file_metadata mismatch"
+        );
+        assert_eq!(
+            remove.partition_values,
+            Some(HashMap::from([("part".to_string(), "value".to_string())])),
+            "partition_values mismatch"
+        );
+        assert_eq!(remove.size, Some(9999), "size mismatch");
+        assert_eq!(
+            remove.stats,
+            Some(r#"{"numRecords":42}"#.to_string()),
+            "stats mismatch"
+        );
+
+        // Verify deletion vector fields
+        let dv = remove
+            .deletion_vector
+            .as_ref()
+            .expect("deletion_vector should be present");
+        assert_eq!(
+            dv.path_or_inline_dv, "vBn[lx{q8@P<9BNH/isA",
+            "deletion_vector.path_or_inline_dv mismatch"
+        );
+        assert_eq!(dv.offset, Some(1), "deletion_vector.offset mismatch");
+        assert_eq!(
+            dv.size_in_bytes, 36,
+            "deletion_vector.size_in_bytes mismatch"
+        );
+        assert_eq!(dv.cardinality, 3, "deletion_vector.cardinality mismatch");
+
+        // Verify row tracking fields (these would have been incorrect with the bug)
+        assert_eq!(
+            remove.base_row_id,
+            Some(100),
+            "base_row_id mismatch - check getter index"
+        );
+        assert_eq!(
+            remove.default_row_commit_version,
+            Some(5),
+            "default_row_commit_version mismatch - check getter index"
+        );
+    }
+
+    #[test]
+    fn test_parse_txn() {
+        let json_strings: StringArray = vec![
+            r#"{"commitInfo":{"timestamp":1670892998177,"operation":"WRITE","operationParameters":{"mode":"Append","partitionBy":"[\"c1\",\"c2\"]"},"isolationLevel":"Serializable","isBlindAppend":true,"operationMetrics":{"numFiles":"3","numOutputRows":"3","numOutputBytes":"1356"},"engineInfo":"Apache-Spark/3.3.1 Delta-Lake/2.2.0","txnId":"046a258f-45e3-4657-b0bf-abfb0f76681c"}}"#,
+            r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"add":{"path":"c1=6/c2=a/part-00011-10619b10-b691-4fd0-acc4-2a9608499d7c.c000.snappy.parquet","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"c3\":4},\"maxValues\":{\"c3\":4},\"nullCount\":{\"c3\":0}}"}}"#,
+            r#"{"txn":{"appId":"myApp","version": 3}}"#,
+            r#"{"txn":{"appId":"myApp2","version": 4, "lastUpdated": 1670892998177}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+        let mut txn_visitor = SetTransactionVisitor::default();
+        txn_visitor.visit_rows_of(batch.as_ref()).unwrap();
+        let mut actual = txn_visitor.set_transactions;
+        assert_eq!(
+            actual.remove("myApp2"),
+            Some(SetTransaction {
+                app_id: "myApp2".to_string(),
+                version: 4,
+                last_updated: Some(1670892998177),
+            })
+        );
+        assert_eq!(
+            actual.remove("myApp"),
+            Some(SetTransaction {
+                app_id: "myApp".to_string(),
+                version: 3,
+                last_updated: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_domain_metadata() {
+        // note: we process commit_1, commit_0 since the visitor expects things in reverse order.
+        // these come from the 'more recent' commit
+        let json_strings: StringArray = vec![
+            r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"domainMetadata":{"domain": "zach1","configuration":"cfg1","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach2","configuration":"cfg2","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach3","configuration":"cfg3","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach4","configuration":"cfg4","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach5","configuration":"cfg5","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach6","configuration":"cfg6","removed": false}}"#,
+        ]
+        .into();
+        let commit_1 = parse_json_batch(json_strings);
+        // these come from the 'older' commit
+        let json_strings: StringArray = vec![
+            r#"{"domainMetadata":{"domain": "zach1","configuration":"old_cfg1","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach2","configuration":"old_cfg2","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach3","configuration":"old_cfg3","removed": false}}"#,
+            r#"{"domainMetadata":{"domain": "zach4","configuration":"old_cfg4","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach7","configuration":"cfg7","removed": true}}"#,
+            r#"{"domainMetadata":{"domain": "zach8","configuration":"cfg8","removed": false}}"#,
+        ]
+        .into();
+        let commit_0 = parse_json_batch(json_strings);
+        let mut domain_metadata_visitor = DomainMetadataVisitor::default();
+        // visit commit 1 then 0
+        domain_metadata_visitor
+            .visit_rows_of(commit_1.as_ref())
+            .unwrap();
+        domain_metadata_visitor
+            .visit_rows_of(commit_0.as_ref())
+            .unwrap();
+        let actual = domain_metadata_visitor.domain_metadatas.clone();
+        let expected = DomainMetadataMap::from([
+            (
+                "zach1".to_string(),
+                DomainMetadata {
+                    domain: "zach1".to_string(),
+                    configuration: "cfg1".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach2".to_string(),
+                DomainMetadata {
+                    domain: "zach2".to_string(),
+                    configuration: "cfg2".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach3".to_string(),
+                DomainMetadata {
+                    domain: "zach3".to_string(),
+                    configuration: "cfg3".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach4".to_string(),
+                DomainMetadata {
+                    domain: "zach4".to_string(),
+                    configuration: "cfg4".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach5".to_string(),
+                DomainMetadata {
+                    domain: "zach5".to_string(),
+                    configuration: "cfg5".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach6".to_string(),
+                DomainMetadata {
+                    domain: "zach6".to_string(),
+                    configuration: "cfg6".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach7".to_string(),
+                DomainMetadata {
+                    domain: "zach7".to_string(),
+                    configuration: "cfg7".to_string(),
+                    removed: true,
+                },
+            ),
+            (
+                "zach8".to_string(),
+                DomainMetadata {
+                    domain: "zach8".to_string(),
+                    configuration: "cfg8".to_string(),
+                    removed: false,
+                },
+            ),
+        ]);
+        assert_eq!(actual, expected);
+
+        let expected = DomainMetadataMap::from([
+            (
+                "zach2".to_string(),
+                DomainMetadata {
+                    domain: "zach2".to_string(),
+                    configuration: "cfg2".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach4".to_string(),
+                DomainMetadata {
+                    domain: "zach4".to_string(),
+                    configuration: "cfg4".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach6".to_string(),
+                DomainMetadata {
+                    domain: "zach6".to_string(),
+                    configuration: "cfg6".to_string(),
+                    removed: false,
+                },
+            ),
+            (
+                "zach8".to_string(),
+                DomainMetadata {
+                    domain: "zach8".to_string(),
+                    configuration: "cfg8".to_string(),
+                    removed: false,
+                },
+            ),
+        ]);
+        assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
+
+        // test filtering
+        let mut domain_metadata_visitor =
+            DomainMetadataVisitor::new(Some(HashSet::from(["zach3".to_string()])));
+        domain_metadata_visitor
+            .visit_rows_of(commit_1.as_ref())
+            .unwrap();
+        domain_metadata_visitor
+            .visit_rows_of(commit_0.as_ref())
+            .unwrap();
+        let actual = domain_metadata_visitor.domain_metadatas.clone();
+        let expected = DomainMetadataMap::from([(
+            "zach3".to_string(),
+            DomainMetadata {
+                domain: "zach3".to_string(),
+                configuration: "cfg3".to_string(),
+                removed: true,
+            },
+        )]);
+        assert_eq!(actual, expected);
+        let expected = DomainMetadataMap::from([]);
+        assert_eq!(domain_metadata_visitor.into_domain_metadatas(), expected);
+
+        // test filtering for a domain that is not present
+        let mut domain_metadata_visitor =
+            DomainMetadataVisitor::new(Some(HashSet::from(["notexist".to_string()])));
+        domain_metadata_visitor
+            .visit_rows_of(commit_1.as_ref())
+            .unwrap();
+        domain_metadata_visitor
+            .visit_rows_of(commit_0.as_ref())
+            .unwrap();
+        assert!(domain_metadata_visitor.domain_metadatas.is_empty());
+    }
+
+    #[test]
+    fn test_domain_metadata_visitor_multi_domain_filter() {
+        // Reuse the same two-commit setup from test_parse_domain_metadata.
+        // commit_1 (newer): zach1(removed), zach2, zach3(removed), zach4, zach5(removed), zach6
+        // commit_0 (older): zach1(removed), zach2, zach3, zach4(removed), zach7(removed), zach8
+        let commit_1: Box<dyn EngineData> = parse_json_batch(
+            vec![
+                r#"{"domainMetadata":{"domain":"zach1","configuration":"cfg1","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach2","configuration":"cfg2","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach3","configuration":"cfg3","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach4","configuration":"cfg4","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach5","configuration":"cfg5","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach6","configuration":"cfg6","removed":false}}"#,
+            ]
+            .into(),
+        );
+        let commit_0: Box<dyn EngineData> = parse_json_batch(
+            vec![
+                r#"{"domainMetadata":{"domain":"zach1","configuration":"old_cfg1","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach2","configuration":"old_cfg2","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach3","configuration":"old_cfg3","removed":false}}"#,
+                r#"{"domainMetadata":{"domain":"zach4","configuration":"old_cfg4","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach7","configuration":"cfg7","removed":true}}"#,
+                r#"{"domainMetadata":{"domain":"zach8","configuration":"cfg8","removed":false}}"#,
+            ]
+            .into(),
+        );
+
+        // --- filter for two active domains both in commit_1 ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach2".to_string(),
+            "zach4".to_string(),
+        ])));
+        assert!(!visitor.filter_found()); // nothing found yet
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        // both zach2 and zach4 appear in commit_1, so early termination should trigger
+        assert!(visitor.filter_found());
+        // commit_0 would NOT be visited in a real replay (early termination), but even if it
+        // were the results should be the same since commit_1 entries take precedence
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["zach2"].configuration, "cfg2");
+        assert_eq!(result["zach4"].configuration, "cfg4");
+
+        // --- filter spanning both commits (zach2 in commit_1, zach8 in commit_0) ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach2".to_string(),
+            "zach8".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        // only zach2 found so far — should NOT terminate early yet
+        assert!(!visitor.filter_found());
+        visitor.visit_rows_of(commit_0.as_ref()).unwrap();
+        // now zach8 found too
+        assert!(visitor.filter_found());
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["zach2"].configuration, "cfg2");
+        assert_eq!(result["zach8"].configuration, "cfg8");
+
+        // --- filter where one domain is removed (tombstone) ---
+        // zach3 is removed in commit_1; only zach6 survives into_domain_metadatas
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "zach3".to_string(),
+            "zach6".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        assert!(visitor.filter_found()); // both found in commit_1
+        let result = visitor.into_domain_metadatas();
+        assert_eq!(result.len(), 1); // zach3 is removed, filtered out
+        assert_eq!(result["zach6"].configuration, "cfg6");
+
+        // --- filter where no requested domains exist ---
+        let mut visitor = DomainMetadataVisitor::new(Some(HashSet::from([
+            "ghost1".to_string(),
+            "ghost2".to_string(),
+        ])));
+        visitor.visit_rows_of(commit_1.as_ref()).unwrap();
+        visitor.visit_rows_of(commit_0.as_ref()).unwrap();
+        assert!(!visitor.filter_found());
+        assert!(visitor.into_domain_metadatas().is_empty());
+    }
+
+    // ------------------------------------------------------------
+    //  In-commit timestamp visitor tests
+    // ------------------------------------------------------------
+
+    fn add_action() -> &'static str {
+        r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#
+    }
+    fn commit_info_action() -> &'static str {
+        r#"{"commitInfo":{"inCommitTimestamp":1677811178585, "timestamp":1677811178585,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isolationLevel":"WriteSerializable","isBlindAppend":true,"operationMetrics":{"numFiles":"1","numOutputRows":"10","numOutputBytes":"635"},"engineInfo":"Databricks-Runtime/<unknown>","txnId":"a6a94671-55ef-450e-9546-b8465b9147de"}}"#
+    }
+
+    fn transform_batch(batch: Box<dyn EngineData>) -> Box<dyn EngineData> {
+        let engine = SyncEngine::new();
+        let expression =
+            Expression::struct_from([Arc::new(Expression::struct_from([column_expr_ref!(
+                "commitInfo.inCommitTimestamp"
+            )]))]);
+        engine
+            .evaluation_handler()
+            .new_expression_evaluator(
+                get_commit_schema().clone(),
+                expression.into(),
+                InCommitTimestampVisitor::schema().into(),
+            )
+            .unwrap()
+            .evaluate(batch.as_ref())
+            .unwrap()
+    }
+
+    // Helper function to reduce duplication in tests
+    fn run_timestamp_visitor_test(json_strings: Vec<&str>, expected_timestamp: Option<i64>) {
+        let json_strings: StringArray = json_strings.into();
+        let batch = parse_json_batch(json_strings);
+        let batch = transform_batch(batch);
+        let mut visitor = InCommitTimestampVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.in_commit_timestamp, expected_timestamp);
+    }
+
+    #[test]
+    fn commit_info_not_first() {
+        run_timestamp_visitor_test(vec![add_action(), commit_info_action()], None);
+    }
+
+    #[test]
+    fn commit_info_not_present() {
+        run_timestamp_visitor_test(vec![add_action()], None);
+    }
+
+    #[test]
+    fn commit_info_get() {
+        run_timestamp_visitor_test(
+            vec![commit_info_action(), add_action()],
+            Some(1677811178585), // Retrieved ICT
+        );
+    }
+
+    // Helper to create a boolean batch for SelectionVectorVisitor tests
+    fn create_boolean_batch(values: Vec<bool>) -> Box<dyn EngineData> {
+        let array = BooleanArray::from(values);
+        let arrow_schema = ArrowSchema::new(vec![Field::new("output", DataType::Boolean, false)]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(array)]).unwrap();
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    #[rstest::rstest]
+    #[case::empty_batch(vec![], 0, "empty batch should have no filtered rows")]
+    #[case::all_selected(vec![true, true, true, true], 0, "all selected should have no filtered rows")]
+    #[case::all_filtered(vec![false, false, false, false, false], 5, "all filtered should count all rows")]
+    #[case::mixed_selection(vec![true, false, true, false, false, true], 3, "mixed selection should count false values")]
+    fn selection_vector_visitor_counter_accuracy(
+        #[case] input: Vec<bool>,
+        #[case] expected_filtered: u64,
+        #[case] _description: &str,
+    ) {
+        let batch = create_boolean_batch(input.clone());
+        let mut visitor = SelectionVectorVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.selection_vector, input);
+        assert_eq!(visitor.num_filtered, expected_filtered);
+    }
+}

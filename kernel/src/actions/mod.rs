@@ -1,0 +1,3098 @@
+//! Provides parsing and manipulation of the various actions defined in the [Delta
+//! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
+
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use delta_kernel_derive::{
+    internal_api, IntoEngineData, IntoStructData, ToSchema, TryFromStructData,
+};
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+use url::Url;
+use visitors::{MetadataVisitor, ProtocolVisitor};
+
+use self::deletion_vector::DeletionVectorDescriptor;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::Scalar;
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::expressions::{ArrayData, StructData};
+use crate::schema::{
+    is_unsupported_delta_type_error, lazy_schema_ref, schema_ref, SchemaRef, StructField,
+    StructType, ToSchema as _,
+};
+#[cfg(feature = "adaptive-metadata-in-dev")]
+use crate::schema::{schema, ArrayType, DataType};
+use crate::table_features::{
+    FeatureType, TableFeature, LEGACY_READER_FEATURES, MIN_VALID_RW_VERSION,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+};
+use crate::table_properties::TableProperties;
+use crate::utils::require;
+use crate::{
+    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta, FileSize,
+    IntoEngineData, RowVisitor as _,
+};
+
+const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX: &str = "recursion limit exceeded";
+const UNKNOWN_OPERATION: &str = "UNKNOWN";
+
+pub mod deletion_vector;
+pub mod deletion_vector_writer;
+pub mod set_transaction;
+
+// see comment in ../lib.rs for the path module for why we include this way
+#[cfg(feature = "internal-api")]
+pub mod visitors;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod visitors;
+
+#[internal_api]
+pub(crate) const ADD_NAME: &str = "add";
+#[internal_api]
+pub(crate) const REMOVE_NAME: &str = "remove";
+#[internal_api]
+pub(crate) const METADATA_NAME: &str = "metaData";
+#[internal_api]
+pub(crate) const PROTOCOL_NAME: &str = "protocol";
+#[internal_api]
+pub(crate) const SET_TRANSACTION_NAME: &str = "txn";
+#[internal_api]
+pub(crate) const COMMIT_INFO_NAME: &str = "commitInfo";
+#[internal_api]
+pub(crate) const CDC_NAME: &str = "cdc";
+#[internal_api]
+pub(crate) const SIDECAR_NAME: &str = "sidecar";
+#[internal_api]
+pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
+#[internal_api]
+pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[internal_api]
+pub(crate) const CHECKPOINT_ACTION_NAME: &str = "checkpoint";
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[internal_api]
+pub(crate) const CONTENT_ROOT_NAME: &str = "contentRoot";
+
+pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
+
+/// Returns the required leaf used to identify rows containing `action_name`.
+///
+/// Returns `None` when `action_name` is unknown or has no required identifying leaf.
+pub(crate) fn action_presence_leaf(action_name: &str) -> Option<&'static str> {
+    match action_name {
+        ADD_NAME | REMOVE_NAME | CDC_NAME | SIDECAR_NAME => Some("path"),
+        METADATA_NAME => Some("id"),
+        PROTOCOL_NAME => Some("minReaderVersion"),
+        SET_TRANSACTION_NAME => Some("appId"),
+        DOMAIN_METADATA_NAME => Some("domain"),
+        CHECKPOINT_METADATA_NAME => Some("version"),
+        _ => None,
+    }
+}
+
+// === Sub-fields of an AddFile's `stats` struct ===
+// See the Delta protocol spec, "Per-file Statistics", and `expected_stats_schema` in
+// `scan/data_skipping/stats_schema/mod.rs` for the full semantics.
+/// Logical (post-DV) row count, stored as a `long`.
+#[internal_api]
+pub(crate) const NUM_RECORDS: &str = "numRecords";
+/// Per-column null counts, as a nested struct mirroring the table schema.
+#[internal_api]
+pub(crate) const NULL_COUNT: &str = "nullCount";
+/// Per-column lower bounds, as a nested struct mirroring the table schema.
+#[internal_api]
+pub(crate) const MIN_VALUES: &str = "minValues";
+/// Per-column upper bounds, as a nested struct mirroring the table schema.
+#[internal_api]
+pub(crate) const MAX_VALUES: &str = "maxValues";
+/// Whether the min/max/nullCount stats are tight or wide. Defaults to `true` when absent.
+#[internal_api]
+pub(crate) const TIGHT_BOUNDS: &str = "tightBounds";
+
+/// Struct-encoded per-file statistics column (checkpoints with `writeStatsAsStruct=true`).
+#[internal_api]
+pub(crate) const STATS_PARSED: &str = "stats_parsed";
+
+pub(crate) static ADD_SCHEMA: LazyLock<StructType> = LazyLock::new(Add::to_schema);
+
+pub(crate) static ADD_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(ADD_NAME, ADD_SCHEMA.clone()));
+pub(crate) static REMOVE_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(REMOVE_NAME, Remove::to_schema()));
+pub(crate) static METADATA_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(METADATA_NAME, Metadata::to_schema()));
+pub(crate) static PROTOCOL_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()));
+pub(crate) static SET_TRANSACTION_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()));
+pub(crate) static COMMIT_INFO_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()));
+pub(crate) static CDC_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(CDC_NAME, Cdc::to_schema()));
+pub(crate) static DOMAIN_METADATA_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()));
+pub(crate) static CHECKPOINT_METADATA_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema())
+});
+pub(crate) static SIDECAR_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()));
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static CONTENT_ROOT_FIELD: LazyLock<StructField> =
+    LazyLock::new(|| StructField::nullable(CONTENT_ROOT_NAME, ContentRoot::to_schema()));
+
+/// A `sidecar` element inside a `checkpoint` action array. Unlike the V2-checkpoint [`Sidecar`]
+/// (which references spilled file actions), this references spilled user `txn` / `domainMetadata`
+/// entries, discriminated by its `type` field (`"txn"` or `"domainMetadata"`). Its shape is a
+/// [`Sidecar`] prefixed with that `type` column, so the schema is composed from
+/// [`Sidecar::to_schema`] here rather than duplicated: `type` cannot be produced by [`ToSchema`]
+/// (which stringifies the Rust identifier, and `r#type` stringifies to `"r#type"`).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+static CONTENT_SIDECAR_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(
+        SIDECAR_NAME,
+        schema! {
+            not_null "type": STRING,
+            ..(Sidecar::to_schema().into_fields()),
+        },
+    )
+});
+
+/// The `checkpoint` action serializes as an array whose elements are each one of the metadata
+/// actions embedded in an adaptiveMetadata manifest commit. This schema is the union of every
+/// element type that may appear in that array (per the adaptiveMetadata RFC, delta-io/delta#6978):
+/// `checkpointMetadata`, `contentRoot`, `protocol`, `metaData`, `domainMetadata`, `txn`, `sidecar`.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+static CHECKPOINT_ACTION_ELEMENT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&CHECKPOINT_METADATA_FIELD),
+    (&CONTENT_ROOT_FIELD),
+    (&PROTOCOL_FIELD),
+    (&METADATA_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&CONTENT_SIDECAR_FIELD),
+};
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+pub(crate) static CHECKPOINT_ACTION_FIELD: LazyLock<StructField> = LazyLock::new(|| {
+    StructField::nullable(
+        CHECKPOINT_ACTION_NAME,
+        ArrayType::new(CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(), false),
+    )
+});
+
+/// The `checkpoint` action field, present only under the `adaptive-metadata-in-dev` feature;
+/// otherwise an empty iterator.
+fn checkpoint_action_field() -> impl IntoIterator<Item = &'static StructField> {
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    {
+        Some(&*CHECKPOINT_ACTION_FIELD)
+    }
+    #[cfg(not(feature = "adaptive-metadata-in-dev"))]
+    {
+        None::<&'static StructField>
+    }
+}
+
+#[cfg(any(test, feature = "internal-api"))]
+static COMMIT_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&COMMIT_INFO_FIELD),
+    (&CDC_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    ..(checkpoint_action_field()),
+};
+
+static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+    (&METADATA_FIELD),
+    (&PROTOCOL_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&COMMIT_INFO_FIELD),
+    (&CDC_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    ..(checkpoint_action_field()),
+    (&CHECKPOINT_METADATA_FIELD),
+    (&SIDECAR_FIELD),
+};
+
+/// Schema for Add actions in the Delta log.
+/// Wraps the Add action schema in a top-level struct with "add" field name.
+#[internal_api]
+pub(crate) static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&ADD_FIELD) };
+
+/// Schema for Remove actions in the Delta log.
+/// Wraps the Remove action schema in a top-level struct with "remove" field name.
+#[internal_api]
+pub(crate) static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&REMOVE_FIELD) };
+
+#[internal_api]
+pub(crate) static LOG_METADATA_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&METADATA_FIELD) };
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[internal_api]
+pub(crate) static LOG_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> =
+    lazy_schema_ref! { (&CHECKPOINT_ACTION_FIELD) };
+
+#[internal_api]
+pub(crate) static LOG_PROTOCOL_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! { (&PROTOCOL_FIELD) };
+
+/// Schema for CommitInfo actions in the Delta log.
+/// Wraps the CommitInfo schema in a top-level struct with "commitInfo" field name.
+#[internal_api]
+pub(crate) static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> =
+    lazy_schema_ref! { (&COMMIT_INFO_FIELD) };
+
+/// Schema for transaction (txn) actions in the Delta log.
+/// Wraps the SetTransaction schema in a top-level struct with "txn" field name.
+#[internal_api]
+pub(crate) static LOG_TXN_SCHEMA: LazyLock<SchemaRef> =
+    lazy_schema_ref! { (&SET_TRANSACTION_FIELD) };
+
+#[internal_api]
+pub(crate) static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> =
+    lazy_schema_ref! { (&DOMAIN_METADATA_FIELD) };
+
+#[cfg(any(test, feature = "internal-api"))]
+#[internal_api]
+/// Gets the schema for all actions that can appear in commits
+/// logs.  This excludes actions that can only appear in checkpoints.
+pub(crate) fn get_commit_schema() -> &'static SchemaRef {
+    &COMMIT_SCHEMA
+}
+
+#[internal_api]
+#[allow(dead_code)]
+/// Gets a schema for all actions defined by the delta spec.
+pub(crate) fn get_all_actions_schema() -> &'static SchemaRef {
+    &ALL_ACTIONS_SCHEMA
+}
+
+/// Returns true if the schema contains file actions (add or remove)
+/// columns.
+#[internal_api]
+pub(crate) fn schema_contains_file_actions(schema: &SchemaRef) -> bool {
+    schema.contains(ADD_NAME) || schema.contains(REMOVE_NAME)
+}
+
+/// Nest an existing add action schema in an additional [`ADD_NAME`] struct.
+///
+/// This is useful for JSON conversion, as it allows us to wrap a dynamically maintained add action
+/// schema in a top-level "add" struct.
+pub(crate) fn as_log_add_schema(add_schema: SchemaRef) -> SchemaRef {
+    schema_ref! { nullable ADD_NAME: (add_schema) }
+}
+
+// Serde derives are needed for CRC file deserialization (see `crc::reader`).
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, TryFromStructData,
+)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct Format {
+    /// Name of the encoding for files in this table
+    pub(crate) provider: String,
+    /// A map containing configuration options for the format
+    pub(crate) options: HashMap<String, String>,
+}
+
+impl Default for Format {
+    fn default() -> Self {
+        Self {
+            provider: String::from("parquet"),
+            options: HashMap::new(),
+        }
+    }
+}
+
+// Serde derives are needed for CRC file deserialization (see `crc::reader`).
+//
+// TODO(#2446): `Metadata` stores the schema only as a JSON string. Callers that already hold
+// a parsed `SchemaRef` (e.g. CREATE TABLE) serialize into `schema_string` and then re-parse
+// downstream in `TableConfiguration::try_new` via `parse_schema()`. Caching the parsed schema
+// on `Metadata` would eliminate the round-trip.
+#[derive(
+    Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct Metadata {
+    /// Unique identifier for this table
+    id: String,
+    /// User-provided identifier for this table
+    name: Option<String>,
+    /// User-provided description for this table
+    description: Option<String>,
+    /// Specification of the encoding for the files stored in the table
+    format: Format,
+    /// Schema of the table
+    schema_string: String,
+    /// Column names by which the data should be partitioned
+    partition_columns: Vec<String>,
+    /// The time when this metadata action is created, in milliseconds since the Unix epoch
+    created_time: Option<i64>,
+    /// Configuration options for the metadata action. These are parsed into [`TableProperties`].
+    configuration: HashMap<String, String>,
+}
+
+impl Metadata {
+    /// Create a new [`Metadata`] instances.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are any metadata columns in the schema.
+    #[internal_api]
+    pub(crate) fn try_new(
+        name: Option<String>,
+        description: Option<String>,
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+        created_time: i64,
+        configuration: HashMap<String, String>,
+    ) -> DeltaResult<Self> {
+        // Validate that the schema does not contain metadata columns
+        // Note: We don't have to look for nested metadata columns because that is already validated
+        // when creating a StructType.
+        if let Some(metadata_field) = schema.fields().find(|field| field.is_metadata_column()) {
+            return Err(Error::Schema(format!(
+                "Table schema must not contain metadata columns. Found metadata column: '{}'",
+                metadata_field.name
+            )));
+        }
+
+        Ok(Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            description,
+            // As of Delta Lake 0.3.0, user-facing APIs only allow the creation of tables where
+            // format = 'parquet' and options = {}. Support for reading other formats is present
+            // both for legacy reasons and to enable possible support for other formats in the
+            // future (See delta-io/delta#87).
+            format: Format::default(),
+            schema_string: serde_json::to_string(&schema)?,
+            partition_columns,
+            created_time: Some(created_time),
+            configuration,
+        })
+    }
+
+    #[internal_api]
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
+        let mut visitor = MetadataVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.metadata)
+    }
+
+    // TODO(#1068/1069): make these just pub directly or make better internal_api macro for fields
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn created_time(&self) -> Option<i64> {
+        self.created_time
+    }
+
+    #[internal_api]
+    pub(crate) fn configuration(&self) -> &HashMap<String, String> {
+        &self.configuration
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn format_provider(&self) -> &str {
+        &self.format.provider
+    }
+
+    #[internal_api]
+    pub(crate) fn schema_string(&self) -> &String {
+        &self.schema_string
+    }
+
+    /// Parses the table schema from its JSON representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Schema`] when the schema exceeds the supported decoding depth or
+    /// declares a type the kernel doesn't support, or [`Error::MalformedJson`] for other
+    /// JSON decoding failures.
+    #[internal_api]
+    pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
+        // TODO(#1896): Increase the supported nesting depth or use non-recursive schema decoding.
+        serde_json::from_str(&self.schema_string).map_err(|error| {
+            // serde_json keeps ErrorCode::RecursionLimitExceeded private, so we use string
+            // matching.
+            if error.is_syntax()
+                && error
+                    .to_string()
+                    .starts_with(SERDE_JSON_RECURSION_LIMIT_ERROR_PREFIX)
+            {
+                Error::schema(format!(
+                    "Table schema is too deeply nested: decoding metaData.schemaString exceeded \
+                     serde_json's recursion limit: {error}"
+                ))
+                .with_backtrace()
+            } else if is_unsupported_delta_type_error(&error) {
+                Error::schema(error.to_string()).with_backtrace()
+            } else {
+                error.into()
+            }
+        })
+    }
+
+    #[internal_api]
+    pub(crate) fn partition_columns(&self) -> &[String] {
+        &self.partition_columns
+    }
+
+    /// Parse the metadata configuration HashMap<String, String> into a TableProperties struct.
+    /// Note that parsing is infallible -- any items that fail to parse are simply propagated
+    /// through to the `TableProperties.unknown_properties` field.
+    #[internal_api]
+    pub(crate) fn parse_table_properties(&self) -> TableProperties {
+        TableProperties::from(self.configuration.iter())
+    }
+
+    /// Returns a new Metadata with the schema replaced, preserving all other fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if schema serialization fails.
+    pub(crate) fn with_schema(self, schema: SchemaRef) -> DeltaResult<Self> {
+        Ok(Self {
+            schema_string: serde_json::to_string(&schema)?,
+            ..self
+        })
+    }
+
+    /// Returns a new Metadata with a single configuration entry inserted (or replaced),
+    /// preserving all other configuration entries and metadata fields.
+    pub(crate) fn with_configuration_entry(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.configuration.insert(key.into(), value.into());
+        self
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_unchecked(
+        id: impl Into<String>,
+        name: Option<String>,
+        description: Option<String>,
+        format: Format,
+        schema_string: impl Into<String>,
+        partition_columns: Vec<String>,
+        created_time: Option<i64>,
+        configuration: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name,
+            description,
+            format,
+            schema_string: schema_string.into(),
+            partition_columns,
+            created_time,
+            configuration,
+        }
+    }
+}
+
+// NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
+// and create_one expects flattened values for nested schemas.
+impl IntoEngineData for Metadata {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        // For format, we need to provide individual scalars for provider and options
+        let values = [
+            self.id.into(),
+            self.name.into(),
+            self.description.into(),
+            self.format.provider.into(),
+            self.format.options.into(),
+            self.schema_string.into(),
+            self.partition_columns.into(),
+            self.created_time.into(),
+            self.configuration.into(),
+        ];
+
+        engine.evaluation_handler().create_one(schema, &values)
+    }
+}
+
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    ToSchema,
+    IntoStructData,
+    Serialize,
+    Deserialize,
+    IntoEngineData,
+)]
+// Deserialization goes through `ProtocolRaw` so every serde entry point (e.g. CRC files) is
+// validated by `try_new`, like the JSON-replay path. Otherwise a CRC file could load a malformed
+// feature shape that log replay would reject.
+#[serde(rename_all = "camelCase", try_from = "ProtocolRaw")]
+// TODO move to another module so that we disallow constructing this struct without using the
+// try_new function.
+pub struct Protocol {
+    /// The minimum version of the Delta read protocol that a client must implement
+    /// in order to correctly read this table
+    min_reader_version: i32,
+    /// The minimum version of the Delta write protocol that a client must implement
+    /// in order to correctly write this table
+    min_writer_version: i32,
+    /// A collection of features that a client must implement in order to correctly
+    /// read this table (exist only when minReaderVersion is set to 3)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reader_features: Option<Vec<TableFeature>>,
+    /// A collection of features that a client must implement in order to correctly
+    /// write this table (exist only when minWriterVersion is set to 7)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writer_features: Option<Vec<TableFeature>>,
+}
+
+/// Raw, unvalidated form of [`Protocol`] that serde reads before validation. Deserialize-only
+/// (never serialized): `Protocol`'s `#[serde(try_from)]` converts it via [`Protocol::try_new`],
+/// so every deserialization is validated.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProtocolRaw {
+    min_reader_version: i32,
+    min_writer_version: i32,
+    reader_features: Option<Vec<TableFeature>>,
+    writer_features: Option<Vec<TableFeature>>,
+}
+
+impl TryFrom<ProtocolRaw> for Protocol {
+    type Error = Error;
+
+    fn try_from(protocol: ProtocolRaw) -> DeltaResult<Self> {
+        Protocol::try_new(
+            protocol.min_reader_version,
+            protocol.min_writer_version,
+            protocol.reader_features,
+            protocol.writer_features,
+        )
+    }
+}
+
+/// Parse a list of feature identifiers into TableFeatures. Returns `None` for `None` input;
+/// otherwise infallible (unrecognized names become `TableFeature::Unknown`).
+fn parse_features(
+    features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
+) -> Option<Vec<TableFeature>> {
+    let features = features?.into_iter().map(Into::into);
+    Some(features.collect())
+}
+
+impl Protocol {
+    /// Try to create a new modern Protocol instance with the given table feature lists
+    pub(crate) fn try_new_modern(
+        reader_features: impl IntoIterator<Item = impl Into<TableFeature>>,
+        writer_features: impl IntoIterator<Item = impl Into<TableFeature>>,
+    ) -> DeltaResult<Self> {
+        Self::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(reader_features),
+            Some(writer_features),
+        )
+    }
+
+    /// Try to create a new legacy Protocol instance with the given reader/writer versions
+    #[cfg(test)]
+    pub(crate) fn try_new_legacy(
+        min_reader_version: i32,
+        min_writer_version: i32,
+    ) -> DeltaResult<Self> {
+        Self::try_new(
+            min_reader_version,
+            min_writer_version,
+            TableFeature::NO_LIST,
+            TableFeature::NO_LIST,
+        )
+    }
+
+    /// Try to create a new Protocol instance from reader/writer versions and table features.
+    pub(crate) fn try_new(
+        min_reader_version: i32,
+        min_writer_version: i32,
+        reader_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
+        writer_features: Option<impl IntoIterator<Item = impl Into<TableFeature>>>,
+    ) -> DeltaResult<Self> {
+        require!(
+            min_reader_version >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_reader_version must be >= {MIN_VALID_RW_VERSION}, got {min_reader_version}"
+            ))
+        );
+        require!(
+            min_writer_version >= MIN_VALID_RW_VERSION,
+            Error::InvalidProtocol(format!(
+                "min_writer_version must be >= {MIN_VALID_RW_VERSION}, got {min_writer_version}"
+            ))
+        );
+
+        let reader_features = parse_features(reader_features);
+        let writer_features = parse_features(writer_features);
+
+        // The protocol states that Reader features may be present if and only if the
+        // min_reader_version is 3
+        if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION {
+            require!(
+                reader_features.is_some(),
+                Error::invalid_protocol(
+                    "Reader features must be present when minimum reader version = 3"
+                )
+            );
+        } else {
+            require!(
+                reader_features.is_none(),
+                Error::invalid_protocol(
+                    "Reader features must not be present when minimum reader version != 3"
+                )
+            );
+        }
+
+        // The protocol states that Writer features may be present if and only if the
+        // min_writer_version is 7
+        if min_writer_version == TABLE_FEATURES_MIN_WRITER_VERSION {
+            require!(
+                writer_features.is_some(),
+                Error::invalid_protocol(
+                    "Writer features must be present when minimum writer version = 7"
+                )
+            );
+        } else {
+            require!(
+                writer_features.is_none(),
+                Error::invalid_protocol(
+                    "Writer features must not be present when minimum writer version != 7"
+                )
+            );
+        }
+
+        // Self- and cross-validate the reader and writer feature lists.
+        match (&reader_features, &writer_features) {
+            (Some(reader_features), Some(writer_features)) => {
+                // Check all reader features are ReaderWriter and present in writer features.
+                // Unknown features are treated as potentially ReaderWriter for forward
+                // compatibility.
+                if let Some(offending) = reader_features.iter().find(|feature| {
+                    !matches!(
+                        feature.feature_type(),
+                        FeatureType::ReaderWriter | FeatureType::Unknown
+                    ) || !writer_features.contains(*feature)
+                }) {
+                    return Err(Error::invalid_protocol(format!(
+                        "Reader features must contain only ReaderWriter features that are also \
+                         listed in writer features, but {offending:?} is not \
+                         (readerFeatures={reader_features:?}, writerFeatures={writer_features:?}, \
+                         minReaderVersion={min_reader_version}, minWriterVersion={min_writer_version})"
+                    )));
+                }
+
+                // Every ReaderWriter feature in writerFeatures must also appear in readerFeatures.
+                // Unknown features are treated as potentially Writer-only for forward
+                // compatibility.
+                //
+                // Accept the legacy writer-list-only shape for delta-spark compatibility: a
+                // past delta-spark bug produced (3, 7) tables with ColumnMapping in writerFeatures
+                // only and an empty readerFeatures. Such tables still read correctly because the
+                // mode comes from writerFeatures, and rejecting them would break existing
+                // production tables. See #3110 to tighten this once such tables are migrated.
+                //
+                // Validate the whole writer list before warning: a non-legacy orphan rejects the
+                // protocol outright, so we must not emit an acceptance warning for a legacy orphan
+                // seen earlier in the list only to fail on a later one.
+                let mut legacy_orphans = Vec::new();
+                for feature in writer_features.iter() {
+                    let orphaned_reader_writer_feature = feature.feature_type()
+                        == FeatureType::ReaderWriter
+                        && !reader_features.contains(feature);
+                    if !orphaned_reader_writer_feature {
+                        continue;
+                    }
+                    if LEGACY_READER_FEATURES.contains(feature) {
+                        legacy_orphans.push(feature);
+                    } else {
+                        return Err(Error::invalid_protocol(format!(
+                            "Writer features must be Writer-only or also listed in reader features, \
+                             but ReaderWriter feature {feature:?} is listed in writerFeatures and \
+                             missing from readerFeatures \
+                             (readerFeatures={reader_features:?}, \
+                             writerFeatures={writer_features:?}, \
+                             minReaderVersion={min_reader_version}, \
+                             minWriterVersion={min_writer_version})"
+                        )));
+                    }
+                }
+                // Reached only once the whole writer list is known valid.
+                for feature in legacy_orphans {
+                    warn!(
+                        "ReaderWriter feature {feature:?} is listed in writerFeatures but \
+                         missing from readerFeatures at minReaderVersion={min_reader_version}; \
+                         treating it as reader-enabled (malformed protocol)"
+                    );
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            (None, Some(writer_features)) => {
+                // Special case: reader version 2 implies ColumnMapping support.
+                // All other ReaderWriter features require explicit reader_features list (reader
+                // version 3). Unknown features are treated as potentially
+                // Writer-only for forward compatibility.
+                if let Some(offending) = writer_features.iter().find(|feature| {
+                    match feature.feature_type() {
+                        FeatureType::WriterOnly | FeatureType::Unknown => false,
+                        FeatureType::ReaderWriter => {
+                            // ColumnMapping is allowed when reader version is 2 (implied support)
+                            !(min_reader_version == 2 && *feature == &TableFeature::ColumnMapping)
+                        }
+                    }
+                }) {
+                    return Err(Error::invalid_protocol(format!(
+                        "Writer features must be Writer-only or also listed in reader features, \
+                         but ReaderWriter feature {offending:?} is listed in writerFeatures with \
+                         no reader features present \
+                         (writerFeatures={writer_features:?}, minReaderVersion={min_reader_version}, \
+                         minWriterVersion={min_writer_version})"
+                    )));
+                }
+                Ok(())
+            }
+            (Some(_), None) => Err(Error::invalid_protocol(
+                "Reader features should be present in writer features",
+            )),
+        }?;
+
+        Ok(Protocol {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        })
+    }
+
+    /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
+    /// a Protocol instance. If no protocol row is found, returns Ok(None).
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Protocol>> {
+        let mut visitor = ProtocolVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.protocol)
+    }
+
+    /// This protocol's minimum reader version
+    #[internal_api]
+    pub(crate) fn min_reader_version(&self) -> i32 {
+        self.min_reader_version
+    }
+
+    /// This protocol's minimum writer version
+    #[internal_api]
+    pub(crate) fn min_writer_version(&self) -> i32 {
+        self.min_writer_version
+    }
+
+    /// Get the reader features for the protocol
+    #[internal_api]
+    pub(crate) fn reader_features(&self) -> Option<&[TableFeature]> {
+        self.reader_features.as_deref()
+    }
+
+    /// Get the writer features for the protocol
+    #[internal_api]
+    pub(crate) fn writer_features(&self) -> Option<&[TableFeature]> {
+        self.writer_features.as_deref()
+    }
+
+    /// True if this protocol has the requested feature
+    pub(crate) fn has_table_feature(&self, feature: &TableFeature) -> bool {
+        // Since each reader features is a subset of writer features, we only check writer feature
+        self.writer_features()
+            .is_some_and(|features| features.contains(feature))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(
+        min_reader_version: i32,
+        min_writer_version: i32,
+        reader_features: Option<Vec<TableFeature>>,
+        writer_features: Option<Vec<TableFeature>>,
+    ) -> Self {
+        Self {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[internal_api]
+#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
+pub(crate) struct CommitInfo {
+    /// The time this logical file was created, as milliseconds since the epoch.
+    /// Read: optional, write: required (that is, kernel always writes).
+    pub(crate) timestamp: Option<i64>,
+    /// The time this logical file was created, as milliseconds since the epoch. Unlike
+    /// `timestamp`, this field is guaranteed to be monotonically increase with each commit.
+    /// Note: If in-commit timestamps are enabled, both the following must be true:
+    /// - The `inCommitTimestamp` field must always be present in CommitInfo.
+    /// - The CommitInfo action must always be the first one in a commit.
+    pub(crate) in_commit_timestamp: Option<i64>,
+    /// An arbitrary string that identifies the operation associated with this commit. This is
+    /// specified by the engine. Read: optional, write: required (that is, kernel alwarys writes).
+    pub(crate) operation: Option<String>,
+    /// Map of arbitrary string key-value pairs that provide additional information about the
+    /// operation. This is specified by the engine. For now this is always empty on write.
+    pub(crate) operation_parameters: Option<HashMap<String, Option<String>>>,
+    /// Map of arbitrary string key-value pairs that provide operation metrics.
+    /// This is specified by the engine.
+    pub(crate) operation_metrics: Option<HashMap<String, Option<String>>>,
+    /// The version of the delta_kernel crate used to write this commit. The kernel will always
+    /// write this field, but it is optional since many tables will not have this field (i.e. any
+    /// tables not written by kernel).
+    pub(crate) kernel_version: Option<String>,
+    /// Whether this commit is a blind append.
+    pub(crate) is_blind_append: Option<bool>,
+    /// A place for the engine to store additional metadata associated with this commit
+    pub(crate) engine_info: Option<String>,
+    /// A unique transaction identifier for this commit.
+    pub(crate) txn_id: Option<String>,
+}
+
+impl CommitInfo {
+    pub(crate) fn new(
+        timestamp: i64,
+        in_commit_timestamp: Option<i64>,
+        operation: Option<String>,
+        engine_info: Option<String>,
+        is_blind_append: bool,
+    ) -> Self {
+        Self {
+            timestamp: Some(timestamp),
+            in_commit_timestamp,
+            operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
+            operation_parameters: Some(HashMap::new()),
+            operation_metrics: None,
+            kernel_version: Some(format!("v{KERNEL_VERSION}")),
+            is_blind_append: is_blind_append.then_some(true),
+            engine_info,
+            txn_id: Some(uuid::Uuid::new_v4().to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
+#[internal_api]
+pub(crate) struct Add {
+    /// A relative path to a data file from the root of the table or an absolute path to a file
+    /// that should be added to the table. The path is a URI as specified by
+    /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
+    ///
+    /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
+    pub(crate) path: String,
+
+    /// A map from partition column to value for this logical file. This map can contain null in
+    /// the values meaning a partition is null. We drop those values from this map, due to the
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
+    #[allow_null_container_values]
+    pub(crate) partition_values: HashMap<String, String>,
+
+    /// The size of this data file in bytes
+    pub(crate) size: i64,
+
+    /// The time this logical file was created, as milliseconds since the epoch.
+    pub(crate) modification_time: i64,
+
+    /// When `false` the logical file must already be present in the table or the records
+    /// in the added file must be contained in one or more remove actions in the same version.
+    pub(crate) data_change: bool,
+
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this
+    /// logical file encoded as a JSON string.
+    ///
+    /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub stats: Option<String>,
+
+    /// Map containing metadata about this logical file.
+    /// Note: map values can be null.
+    /// We don't use `#[allow_null_container_values]` here because [`MapItem::materialize`]
+    /// drops null values when that attribute is present.
+    ///
+    /// [`MapItem::materialize`]: crate::engine_data::MapItem::materialize
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub tags: Option<HashMap<String, Option<String>>>,
+
+    /// Information about deletion vector (DV) associated with this add action
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub deletion_vector: Option<DeletionVectorDescriptor>,
+
+    /// Default generated Row ID of the first row in the file. The default generated Row IDs
+    /// of the other rows in the file can be reconstructed by adding the physical index of the
+    /// row within the file to the base Row ID.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub base_row_id: Option<i64>,
+
+    /// First commit version in which an add action with the same path was committed to the table.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub default_row_commit_version: Option<i64>,
+
+    /// The name of the clustering implementation
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub clustering_provider: Option<String>,
+}
+
+impl Add {
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn dv_unique_id(&self) -> Option<String> {
+        self.deletion_vector.as_ref().map(|dv| dv.unique_id())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
+#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
+pub(crate) struct Remove {
+    /// A relative path to a data file from the root of the table or an absolute path to a file
+    /// that should be added to the table. The path is a URI as specified by
+    /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
+    ///
+    /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
+    pub(crate) path: String,
+
+    /// The time this logical file was created, as milliseconds since the epoch.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) deletion_timestamp: Option<i64>,
+
+    /// When `false` the logical file must already be present in the table or the records
+    /// in the added file must be contained in one or more remove actions in the same version.
+    pub(crate) data_change: bool,
+
+    /// When true the fields `partition_values`, `size`, and `tags` are present
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) extended_file_metadata: Option<bool>,
+
+    /// A map from partition column to value for this logical file. This map can contain null in
+    /// the values meaning a partition is null. We drop those values from this map, due to the
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    #[allow_null_container_values]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) partition_values: Option<HashMap<String, String>>,
+
+    /// The size of this data file in bytes
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) size: Option<i64>,
+
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this
+    /// logical file encoded as a JSON string.
+    ///
+    /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub stats: Option<String>,
+
+    /// Map containing metadata about this logical file. Values can be null.
+    #[allow_null_container_values]
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) tags: Option<HashMap<String, String>>,
+
+    /// Information about deletion vector (DV) associated with this add action
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) deletion_vector: Option<DeletionVectorDescriptor>,
+
+    /// Default generated Row ID of the first row in the file. The default generated Row IDs
+    /// of the other rows in the file can be reconstructed by adding the physical index of the
+    /// row within the file to the base Row ID
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) base_row_id: Option<i64>,
+
+    /// First commit version in which an add action with the same path was committed to the table.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) default_row_commit_version: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
+#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
+pub(crate) struct Cdc {
+    /// A relative path to a change data file from the root of the table or an absolute path to a
+    /// change data file that should be added to the table. The path is a URI as specified by
+    /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the file path.
+    ///
+    /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
+    pub path: String,
+
+    /// A map from partition column to value for this logical file. This map can contain null in
+    /// the values meaning a partition is null. We drop those values from this map, due to the
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::MapItem::materialize
+    #[allow_null_container_values]
+    pub partition_values: HashMap<String, String>,
+
+    /// The size of this cdc file in bytes
+    pub size: i64,
+
+    /// When `false` the logical file must already be present in the table or the records
+    /// in the added file must be contained in one or more remove actions in the same version.
+    ///
+    /// Should always be set to false for `cdc` actions because they *do not* change the underlying
+    /// data of the table
+    pub data_change: bool,
+
+    /// Map containing metadata about this logical file. Values can be null.
+    #[allow_null_container_values]
+    pub tags: Option<HashMap<String, String>>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, IntoEngineData,
+)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct SetTransaction {
+    /// A unique identifier for the application performing the transaction.
+    pub(crate) app_id: String,
+
+    /// An application-specific numeric identifier for this transaction.
+    pub(crate) version: i64,
+
+    /// The time when this transaction action was created in milliseconds since the Unix epoch.
+    pub(crate) last_updated: Option<i64>,
+}
+
+impl SetTransaction {
+    pub(crate) fn new(app_id: String, version: i64, last_updated: Option<i64>) -> Self {
+        Self {
+            app_id,
+            version,
+            last_updated,
+        }
+    }
+
+    /// Whether this transaction is expired: `last_updated <= expiration_timestamp` with both
+    /// present. A `None` `last_updated` (no timestamp recorded) or a `None` `expiration_timestamp`
+    /// (no retention duration configured) never expires.
+    pub(crate) fn is_expired(&self, expiration_timestamp: Option<i64>) -> bool {
+        matches!(
+            (expiration_timestamp, self.last_updated),
+            (Some(exp_ts), Some(lu)) if lu <= exp_ts
+        )
+    }
+
+    /// This transaction's `version`, unless it is expired under `expiration_timestamp`.
+    pub(crate) fn non_expired_version(&self, expiration_timestamp: Option<i64>) -> Option<i64> {
+        (!self.is_expired(expiration_timestamp)).then_some(self.version)
+    }
+}
+
+/// Reference to a root of an adaptive metadata tree.
+///
+/// Contains the path, size, and version of the root manifest file.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData)]
+#[internal_api]
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
+pub(crate) struct ContentRoot {
+    /// Path to the root manifest file. It is absolute if it begins with an [RFC 3986] URI scheme
+    /// (e.g. `s3://bucket/...`); otherwise it is relative and resolved against the table root by
+    /// concatenation with a `/` separator, matching the [Iceberg V4 relative paths specification].
+    /// Unlike [`Add`]/[`Remove`] paths, this is not RFC 2396 percent-encoded.
+    ///
+    /// [RFC 3986]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+    /// [Iceberg V4 relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
+    pub(crate) path: String,
+    /// Size of the root manifest file in bytes. Not exposed directly -- use
+    /// [`ContentRoot::to_filemeta`] to get a validated [`FileMeta`].
+    size_in_bytes: i64,
+    /// The table version the root manifest reflects. Per the adaptiveMetadata RFC this is
+    /// `<= checkpointMetadata.version`: equal in a manifest commit, and strictly less in a
+    /// standalone checkpoint (where inline file actions cover the gap up to the checkpoint
+    /// version). Distinct from [`CheckpointAction::version`], which is
+    /// `checkpointMetadata.version`.
+    version: i64,
+}
+
+/// The checkpoint action embeds metadata tree state in a Delta log entry.
+///
+/// When a manifest commit occurs, the Delta log entry contains a `checkpoint` action that
+/// references a root manifest file. The `version` field indicates the table version up to
+/// which the checkpoint is complete. For manifest commits, the checkpoint action also contains
+/// the table protocol and metadata, making the commit self-contained with respect to P+M.
+///
+///
+/// [adaptiveMetadata RFC]: https://github.com/delta-io/delta/pull/6978
+///
+/// Example manifest-commit JSON:
+/// ```json
+/// { "checkpoint": [
+///     { "checkpointMetadata": { "version": 42 } },
+///     { "contentRoot": { "path": "...", "sizeInBytes": 1024, "version": 42 } },
+///     { "protocol": { ... } },
+///     { "metaData": { ... } },
+///     { "txn": { ... } },
+///     { "domainMetadata": { ... } },
+///     { "sidecar": { "type": "txn", "path": "...", "sizeInBytes": 1024, "modificationTime": 0 } }
+///   ]
+/// }
+/// ```
+#[cfg(feature = "adaptive-metadata-in-dev")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[internal_api]
+pub(crate) struct CheckpointAction {
+    /// The table version up to which the checkpoint is complete, sourced from the wire
+    /// `checkpointMetadata.version`. May be less than or equal to the commit version containing
+    /// this checkpoint action, and is `>= content_root.version` (see [`ContentRoot::version`]).
+    pub(crate) version: i64,
+    /// Reference to the root manifest file.
+    pub(crate) content_root: ContentRoot,
+    /// The table protocol at the checkpoint version.
+    pub(crate) protocol: Protocol,
+    /// The table metadata at the checkpoint version.
+    pub(crate) metadata: Metadata,
+    /// Inline `txn` ([`SetTransaction`]) entries carried in the checkpoint array.
+    pub(crate) transactions: Vec<SetTransaction>,
+    /// Inline `domainMetadata` ([`DomainMetadata`]) entries carried in the checkpoint array.
+    pub(crate) domain_metadata: Vec<DomainMetadata>,
+    /// `sidecar` entries of type `txn`, referencing spilled [`SetTransaction`] actions.
+    pub(crate) txn_sidecars: Vec<Sidecar>,
+    /// `sidecar` entries of type `domainMetadata`, referencing spilled [`DomainMetadata`] actions.
+    pub(crate) domain_metadata_sidecars: Vec<Sidecar>,
+}
+
+// === CheckpointAction -> EngineData ===
+
+/// Build the `sidecar` element payload: a [`Sidecar`] scalar prefixed with a `type` discriminator
+/// (`"txn"` or `"domainMetadata"`), matching [`CONTENT_SIDECAR_FIELD`].
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn content_sidecar_element(type_str: &str, sidecar: Sidecar) -> DeltaResult<Scalar> {
+    let sidecar: StructData = sidecar.into();
+    let fields = std::iter::once(StructField::not_null("type", DataType::STRING))
+        .chain(sidecar.fields().iter().cloned());
+    let values = std::iter::once(Scalar::from(type_str))
+        .chain(sidecar.values().iter().cloned())
+        .collect();
+    // `from_values_unchecked`, not `try_new`: `Sidecar::tags` carries
+    // `#[allow_null_container_values]` so its schema field declares value-nullable maps, while
+    // the derived `.into()` value is a non-nullable map -- a leaf-level mismatch `try_new`
+    // would reject. This is inert because the enclosing `checkpoint_action_union_element` still
+    // validates the composite against `CONTENT_SIDECAR_FIELD`, and materialization derives map
+    // nullability from the schema, not the scalar. Tracked by delta-io/delta-kernel-rs#3136,
+    // which will let this use `try_new`.
+    Ok(Scalar::Struct(StructData::from_values_unchecked(
+        StructType::try_new(fields)?,
+        values,
+    )))
+}
+
+/// Wrap a single element `value` into a full union struct matching the checkpoint array's element
+/// type: the field named `field_name` holds `value`, every other field is a typed null.
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn checkpoint_action_union_element(field_name: &str, value: Scalar) -> DeltaResult<Scalar> {
+    let fields: Vec<StructField> = CHECKPOINT_ACTION_ELEMENT_SCHEMA.fields().cloned().collect();
+    require!(
+        fields.iter().any(|f| f.name() == field_name),
+        Error::generic(format!(
+            "checkpoint union element field {field_name:?} not found in element schema"
+        ))
+    );
+    let values = fields
+        .iter()
+        .map(|field| {
+            if field.name() == field_name {
+                value.clone()
+            } else {
+                Scalar::null(field.data_type().clone())
+            }
+        })
+        .collect();
+    Ok(Scalar::Struct(StructData::try_new(fields, values)?))
+}
+
+// `CheckpointAction` cannot use `#[derive(IntoEngineData)]`/`create_one`: its single `checkpoint`
+// column is an array whose elements are a union struct (one field per action kind), and
+// `create_one` only flattens to leaves. Instead we build the whole column as one non-flattened
+// `Scalar::Array` and materialize it via `create_many` (whose `Scalar::append_to` recurses through
+// Array/Struct/Null).
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl IntoEngineData for CheckpointAction {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        self.validate()?;
+        let checkpoint_metadata = CheckpointMetadata {
+            version: self.version,
+            tags: None,
+        };
+        let mut elements = vec![
+            checkpoint_action_union_element(CHECKPOINT_METADATA_NAME, checkpoint_metadata.into())?,
+            checkpoint_action_union_element(CONTENT_ROOT_NAME, self.content_root.into())?,
+            checkpoint_action_union_element(PROTOCOL_NAME, self.protocol.into())?,
+            checkpoint_action_union_element(METADATA_NAME, self.metadata.into())?,
+        ];
+        for txn in self.transactions {
+            elements.push(checkpoint_action_union_element(
+                SET_TRANSACTION_NAME,
+                txn.into(),
+            )?);
+        }
+        for dm in self.domain_metadata {
+            elements.push(checkpoint_action_union_element(
+                DOMAIN_METADATA_NAME,
+                dm.into(),
+            )?);
+        }
+        for sidecar in self.txn_sidecars {
+            let element = content_sidecar_element(SET_TRANSACTION_NAME, sidecar)?;
+            elements.push(checkpoint_action_union_element(SIDECAR_NAME, element)?);
+        }
+        for sidecar in self.domain_metadata_sidecars {
+            let element = content_sidecar_element(DOMAIN_METADATA_NAME, sidecar)?;
+            elements.push(checkpoint_action_union_element(SIDECAR_NAME, element)?);
+        }
+
+        let array_type = ArrayType::new(CHECKPOINT_ACTION_ELEMENT_SCHEMA.clone(), false);
+        let array = Scalar::Array(ArrayData::try_new(array_type, elements)?);
+        engine.evaluation_handler().create_many(schema, &[&[array]])
+    }
+}
+
+/// Returns whether `location` begins with a URI scheme, per [RFC 3986 section 3.1]:
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, terminated by `:`.
+///
+/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn has_scheme(location: &str) -> bool {
+    for (position, ch) in location.char_indices() {
+        if ch == ':' {
+            return position > 0;
+        }
+        if !is_scheme_char(ch, position) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Returns whether `ch` is allowed at `position` in a URI scheme, per [RFC 3986 section 3.1]:
+/// the first character must be `ALPHA`; subsequent characters may also be `DIGIT`, `+`, `-`, or
+/// `.`. Schemes are restricted to US-ASCII, so non-ASCII letters are rejected.
+///
+/// [RFC 3986 section 3.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-3.1
+#[cfg(feature = "adaptive-metadata-in-dev")]
+fn is_scheme_char(ch: char, position: usize) -> bool {
+    if ch.is_ascii_alphabetic() {
+        return true;
+    }
+    position > 0 && (ch.is_ascii_digit() || ch == '+' || ch == '-' || ch == '.')
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl ContentRoot {
+    /// Convert this root manifest reference into a [`FileMeta`] for engine I/O.
+    ///
+    /// A `path` with a URI scheme is absolute and used as-is; otherwise it is resolved relative to
+    /// `table_root` by concatenation with a single `/` separator, matching Iceberg V4's
+    /// [relative paths specification].
+    ///
+    /// Returns an error if the resolved location fails to parse as a [`Url`], or if the size does
+    /// not fit a [`crate::FileSize`].
+    ///
+    /// [relative paths specification]: https://iceberg.apache.org/spec/#paths-in-metadata
+    #[internal_api]
+    pub(crate) fn to_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
+        let path = &self.path;
+        let location = if has_scheme(path) {
+            // A URI scheme means the path is absolute and used as-is.
+            Url::parse(path).map_err(|e| {
+                Error::generic(format!(
+                    "Failed to parse absolute checkpoint contentRoot path {path:?}: {e}"
+                ))
+            })?
+        } else {
+            // Otherwise the path is relative and concatenated onto `table_root` with a single `/`.
+            let mut base = table_root.as_str().to_string();
+            if !base.ends_with('/') {
+                base.push('/');
+            }
+            Url::parse(&format!("{base}{path}")).map_err(|e| {
+                Error::generic(format!(
+                    "Failed to resolve checkpoint contentRoot path {path:?} against table \
+                     root {base}: {e}"
+                ))
+            })?
+        };
+        Ok(FileMeta {
+            location,
+            last_modified: i64::MAX,
+            size: to_file_size(self.size_in_bytes, "checkpoint contentRoot")?,
+        })
+    }
+}
+
+#[cfg(feature = "adaptive-metadata-in-dev")]
+impl CheckpointAction {
+    /// Parse the first `checkpoint` action in `data`, ignoring any later ones. Rows without a
+    /// `checkpoint` action are skipped, so `Ok(None)` means the batch had none at all.
+    ///
+    /// Returns an error if a `checkpoint` action is present but malformed: a required singleton
+    /// element is missing or repeated, an element or sidecar `type` is unrecognized, or
+    /// `contentRoot.version` exceeds `checkpointMetadata.version`.
+    #[internal_api]
+    pub(crate) fn try_new_from_data(
+        data: &dyn EngineData,
+    ) -> DeltaResult<Option<CheckpointAction>> {
+        let mut visitor = visitors::CheckpointVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.checkpoint)
+    }
+
+    /// Enforce the adaptiveMetadata invariant that `contentRoot.version` never exceeds the
+    /// checkpoint version. Called on both the parse and serialize paths so a `CheckpointAction`
+    /// can never be written in a shape the reader would reject.
+    fn validate(&self) -> DeltaResult<()> {
+        require!(
+            self.content_root.version <= self.version,
+            Error::generic(format!(
+                "checkpoint contentRoot.version {} exceeds checkpointMetadata.version {}",
+                self.content_root.version, self.version
+            ))
+        );
+        Ok(())
+    }
+
+    /// Path to the root manifest file (delegates to the nested [`ContentRoot`]).
+    #[internal_api]
+    pub(crate) fn path(&self) -> &str {
+        &self.content_root.path
+    }
+
+    /// Get the checkpoint version.
+    #[internal_api]
+    pub(crate) fn version(&self) -> i64 {
+        self.version
+    }
+
+    /// Convert the referenced root manifest into a [`FileMeta`] for engine I/O (delegates to
+    /// [`ContentRoot::to_filemeta`]).
+    #[internal_api]
+    pub(crate) fn root_filemeta(&self, table_root: &Url) -> DeltaResult<FileMeta> {
+        self.content_root.to_filemeta(table_root)
+    }
+
+    /// The table protocol embedded in this checkpoint action (at [`Self::version`]).
+    #[internal_api]
+    pub(crate) fn protocol(&self) -> &Protocol {
+        &self.protocol
+    }
+
+    /// The table metadata embedded in this checkpoint action (at [`Self::version`]).
+    #[internal_api]
+    pub(crate) fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+}
+
+/// The sidecar action references a sidecar file which provides some of the checkpoint's
+/// file actions. This action is only allowed in checkpoints following the V2 spec.
+///
+/// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
+#[derive(ToSchema, IntoStructData, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct Sidecar {
+    /// A path to a sidecar file that can be either:
+    /// - A relative path (just the file name) within the `_delta_log/_sidecars` directory.
+    /// - An absolute path
+    /// The path is a URI as specified by [RFC 2396 URI Generic Syntax], which needs to be decoded
+    /// to get the file path.
+    ///
+    /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
+    pub path: String,
+
+    /// The size of the sidecar file in bytes.
+    pub size_in_bytes: i64,
+
+    /// The time this logical file was created, as milliseconds since the epoch.
+    pub modification_time: i64,
+
+    /// A map containing any additional metadata about the logical file. Values can be null.
+    #[allow_null_container_values]
+    pub tags: Option<HashMap<String, String>>,
+}
+
+/// Convert an `i64` byte count from a log action into a [`FileSize`], erroring with `context` (a
+/// short action name, e.g. `"sidecar"`) and the offending value when it is negative.
+fn to_file_size(bytes: i64, context: &str) -> DeltaResult<FileSize> {
+    bytes.try_into().map_err(|_| {
+        Error::generic(format!(
+            "Failed to convert {context} size {bytes} to FileSize"
+        ))
+    })
+}
+
+impl Sidecar {
+    /// Convert a Sidecar record to a FileMeta.
+    ///
+    /// This helper first builds the URL by joining the provided log_root with
+    /// the "_sidecars/" folder and the given sidecar path.
+    pub(crate) fn to_filemeta(&self, log_root: &Url) -> DeltaResult<FileMeta> {
+        Ok(FileMeta {
+            location: log_root.join("_sidecars/")?.join(&self.path)?,
+            last_modified: self.modification_time,
+            size: to_file_size(self.size_in_bytes, "sidecar")?,
+        })
+    }
+}
+
+/// The CheckpointMetadata action describes details about a checkpoint following the V2
+/// specification.
+///
+/// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoStructData, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[internal_api]
+pub(crate) struct CheckpointMetadata {
+    /// The version of the V2 spec checkpoint.
+    ///
+    /// Currently using `i64` for compatibility with other actions' representations.
+    /// Future work will address converting numeric fields to unsigned types (e.g., `u64`) where
+    /// semantically appropriate (e.g., for version, size, timestamps, etc.).
+    /// See issue #786 for tracking progress.
+    pub(crate) version: i64,
+
+    /// Map containing any additional metadata about the V2 spec checkpoint. Values can be null.
+    #[allow_null_container_values]
+    pub(crate) tags: Option<HashMap<String, String>>,
+}
+
+/// The [DomainMetadata] action contains a configuration (string) for a named metadata domain. Two
+/// overlapping transactions conflict if they both contain a domain metadata action for the same
+/// metadata domain.
+///
+/// Note that the `delta.*` domain is reserved for internal use.
+///
+/// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoStructData, IntoEngineData,
+)]
+pub struct DomainMetadata {
+    domain: String,
+    configuration: String,
+    removed: bool,
+}
+
+impl DomainMetadata {
+    /// Create a new DomainMetadata action.
+    pub(crate) fn new(domain: String, configuration: String) -> Self {
+        Self {
+            domain,
+            configuration,
+            removed: false,
+        }
+    }
+
+    /// Create a new DomainMetadata action to remove a domain.
+    pub(crate) fn remove(domain: String, configuration: String) -> Self {
+        Self {
+            domain,
+            configuration,
+            removed: true,
+        }
+    }
+
+    // returns true if the domain metadata is an system-controlled domain (all domains that start
+    // with "delta.")
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn is_internal(&self) -> bool {
+        self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
+    }
+
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub fn configuration(&self) -> &str {
+        &self.configuration
+    }
+
+    /// Returns `true` if this action is a tombstone (marking domain removal).
+    pub fn is_removed(&self) -> bool {
+        self.removed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::*;
+    use crate::arrow::array::{
+        Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
+        MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+    };
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use crate::arrow::json::ReaderBuilder;
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
+    use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::expressions::Scalar;
+    use crate::schema::{schema, schema_ref, DataType, MapType, StructField};
+    use crate::unit_test_utils::assert_result_error_with_message;
+    use crate::{
+        Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
+    };
+
+    #[rstest]
+    #[case::add(ADD_NAME, Some("path"))]
+    #[case::remove(REMOVE_NAME, Some("path"))]
+    #[case::metadata(METADATA_NAME, Some("id"))]
+    #[case::protocol(PROTOCOL_NAME, Some("minReaderVersion"))]
+    #[case::transaction(SET_TRANSACTION_NAME, Some("appId"))]
+    #[case::cdc(CDC_NAME, Some("path"))]
+    #[case::domain_metadata(DOMAIN_METADATA_NAME, Some("domain"))]
+    #[case::checkpoint_metadata(CHECKPOINT_METADATA_NAME, Some("version"))]
+    #[case::sidecar(SIDECAR_NAME, Some("path"))]
+    #[case::witnessless_action(COMMIT_INFO_NAME, None)]
+    #[case::unknown_action("futureAction", None)]
+    fn test_action_presence_leaf(#[case] action_name: &str, #[case] expected_leaf: Option<&str>) {
+        assert_eq!(action_presence_leaf(action_name), expected_leaf);
+    }
+
+    // duplicated
+    struct ExprEngine(Arc<dyn EvaluationHandler>);
+
+    impl ExprEngine {
+        fn new() -> Self {
+            ExprEngine(Arc::new(ArrowEvaluationHandler))
+        }
+    }
+
+    impl Engine for ExprEngine {
+        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+            self.0.clone()
+        }
+
+        fn json_handler(&self) -> Arc<dyn JsonHandler> {
+            unimplemented!()
+        }
+
+        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+            unimplemented!()
+        }
+
+        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+            unimplemented!()
+        }
+    }
+
+    fn create_string_map_builder(
+        nullable_values: bool,
+    ) -> MapBuilder<StringBuilder, StringBuilder> {
+        MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "key_value".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            StringBuilder::new(),
+            StringBuilder::new(),
+        )
+        .with_values_field(Field::new(
+            "value".to_string(),
+            ArrowDataType::Utf8,
+            nullable_values,
+        ))
+    }
+
+    #[rstest]
+    #[case::no_expiration_configured(None, Some(1000), false)]
+    #[case::null_last_updated_never_expires(Some(5000), None, false)]
+    #[case::both_none(None, None, false)]
+    #[case::last_updated_before_expiration(Some(2000), Some(1000), true)]
+    #[case::last_updated_at_expiration(Some(1000), Some(1000), true)]
+    #[case::last_updated_after_expiration(Some(2000), Some(3000), false)]
+    fn test_set_transaction_expiration(
+        #[case] expiration_timestamp: Option<i64>,
+        #[case] last_updated: Option<i64>,
+        #[case] expired: bool,
+    ) {
+        let txn = SetTransaction::new("app".to_string(), 7, last_updated);
+        assert_eq!(txn.is_expired(expiration_timestamp), expired);
+        assert_eq!(
+            txn.non_expired_version(expiration_timestamp),
+            (!expired).then_some(7)
+        );
+    }
+
+    #[test]
+    fn test_metadata_schema() {
+        let schema = get_commit_schema()
+            .project(&[METADATA_NAME])
+            .expect("Couldn't get metaData field");
+
+        let expected = schema_ref! {
+            nullable "metaData": {
+                not_null "id": STRING,
+                nullable "name": STRING,
+                nullable "description": STRING,
+                not_null "format": {
+                    not_null "provider": STRING,
+                    not_null "options": { STRING => not_null STRING },
+                },
+                not_null "schemaString": STRING,
+                not_null "partitionColumns": [ not_null STRING ],
+                nullable "createdTime": LONG,
+                not_null "configuration": { STRING => not_null STRING },
+            },
+        };
+        assert_eq!(schema, expected);
+    }
+
+    #[rstest]
+    #[case::supported(41, false)]
+    #[case::exceeded(42, true)]
+    fn parse_schema_nesting_boundary(#[case] depth: usize, #[case] exceeds_limit: bool) {
+        let metadata = Metadata {
+            schema_string: serde_json::to_string(&nested_schema(depth)).unwrap(),
+            ..Default::default()
+        };
+
+        let result = metadata.parse_schema();
+        if exceeds_limit {
+            assert_result_error_with_message(
+                result.as_ref(),
+                concat!(
+                    "Schema error: Table schema is too deeply nested: decoding ",
+                    "metaData.schemaString exceeded serde_json's ",
+                    "recursion limit: recursion limit exceeded"
+                ),
+            );
+            let error = match result.unwrap_err() {
+                Error::Backtraced { source, .. } => *source,
+                error => error,
+            };
+            assert!(matches!(error, Error::Schema(_)));
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[rstest]
+    // Syntax error -> MalformedJson.
+    #[case::malformed_syntax("{", "MalformedJson")]
+    // Data error lacking the unsupported-type prefix (invalid decimal) -> MalformedJson, NOT
+    // Schema: the reclassification must not fire for every is_data error.
+    #[case::malformed_bad_decimal(
+        r#"{"type":"struct","fields":[{"name":"t","type":"decimal(nope)","nullable":true,"metadata":{}}]}"#,
+        "MalformedJson"
+    )]
+    // Regression guard: a well-formed schema whose wrong-typed field value echoes the prefix must
+    // stay MalformedJson. `nullable` is a bool, so a string value is an is_data error whose message
+    // *contains* the prefix; matching by `starts_with` keeps it out of the Schema arm.
+    #[case::malformed_value_echoes_prefix(
+        r#"{"type":"struct","fields":[{"name":"t","type":"string","nullable":"Unsupported Delta table type","metadata":{}}]}"#,
+        "MalformedJson"
+    )]
+    // Unsupported primitive types -> Schema.
+    #[case::unsupported_time(
+        r#"{"type":"struct","fields":[{"name":"t","type":"time(6)","nullable":true,"metadata":{}}]}"#,
+        "Schema"
+    )]
+    #[case::unsupported_interval(
+        r#"{"type":"struct","fields":[{"name":"t","type":"interval week","nullable":true,"metadata":{}}]}"#,
+        "Schema"
+    )]
+    // Unsupported primitive nested inside a struct field -> Schema (reclassification is
+    // position-agnostic, not limited to top-level columns).
+    #[case::unsupported_nested(
+        r#"{"type":"struct","fields":[{"name":"t","type":{"type":"struct","fields":[{"name":"inner","type":"time(6)","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}"#,
+        "Schema"
+    )]
+    // Unknown complex type -> Schema.
+    #[case::unsupported_complex(
+        r#"{"type":"struct","fields":[{"name":"t","type":{"type":"matrix"},"nullable":true,"metadata":{}}]}"#,
+        "Schema"
+    )]
+    fn parse_schema_error_classification(
+        #[case] schema_string: &str,
+        #[case] expected_error: &str,
+    ) {
+        let metadata = Metadata {
+            schema_string: schema_string.to_string(),
+            ..Default::default()
+        };
+        // Error conversion captures a backtrace only when enabled, so normalize both forms before
+        // checking the underlying error.
+        let error = match metadata.parse_schema().unwrap_err() {
+            Error::Backtraced { source, .. } => *source,
+            error => error,
+        };
+        match expected_error {
+            "MalformedJson" => {
+                assert!(matches!(error, Error::MalformedJson(_)), "got: {error:?}")
+            }
+            "Schema" => {
+                assert!(matches!(error, Error::Schema(_)), "got: {error:?}")
+            }
+            other => panic!("unknown expected_error discriminant: {other}"),
+        }
+    }
+
+    fn nested_schema(depth: usize) -> StructType {
+        (0..depth).fold(
+            schema! { nullable "leaf": INTEGER },
+            |nested, depth| schema! { nullable (format!("level_{depth}")): (nested) },
+        )
+    }
+
+    #[test]
+    fn test_add_schema() {
+        let schema = get_commit_schema()
+            .project(&[ADD_NAME])
+            .expect("Couldn't get add field");
+
+        let expected = schema_ref! {
+            nullable "add": {
+                not_null "path": STRING,
+                not_null "partitionValues": { STRING => nullable STRING },
+                not_null "size": LONG,
+                not_null "modificationTime": LONG,
+                not_null "dataChange": BOOLEAN,
+                nullable "stats": STRING,
+                nullable "tags": { STRING => nullable STRING },
+                (deletion_vector_field()),
+                nullable "baseRowId": LONG,
+                nullable "defaultRowCommitVersion": LONG,
+                nullable "clusteringProvider": STRING,
+            },
+        };
+        assert_eq!(schema, expected);
+    }
+
+    fn tags_field() -> StructField {
+        StructField::nullable(
+            "tags",
+            MapType::new(DataType::STRING, DataType::STRING, true),
+        )
+    }
+
+    fn partition_values_field() -> StructField {
+        StructField::nullable(
+            "partitionValues",
+            MapType::new(DataType::STRING, DataType::STRING, true),
+        )
+    }
+
+    fn deletion_vector_field() -> StructField {
+        StructField::nullable(
+            "deletionVector",
+            schema! {
+                not_null "storageType": STRING,
+                not_null "pathOrInlineDv": STRING,
+                nullable "offset": INTEGER,
+                not_null "sizeInBytes": INTEGER,
+                not_null "cardinality": LONG,
+            },
+        )
+    }
+
+    #[test]
+    fn test_remove_schema() {
+        let schema = get_commit_schema()
+            .project(&[REMOVE_NAME])
+            .expect("Couldn't get remove field");
+        let expected = schema_ref! {
+            nullable "remove": {
+                not_null "path": STRING,
+                nullable "deletionTimestamp": LONG,
+                not_null "dataChange": BOOLEAN,
+                nullable "extendedFileMetadata": BOOLEAN,
+                (partition_values_field()),
+                nullable "size": LONG,
+                nullable "stats": STRING,
+                (tags_field()),
+                (deletion_vector_field()),
+                nullable "baseRowId": LONG,
+                nullable "defaultRowCommitVersion": LONG,
+            },
+        };
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_cdc_schema() {
+        let schema = get_commit_schema()
+            .project(&[CDC_NAME])
+            .expect("Couldn't get cdc field");
+        let expected = schema_ref! {
+            nullable "cdc": {
+                not_null "path": STRING,
+                not_null "partitionValues": { STRING => nullable STRING },
+                not_null "size": LONG,
+                not_null "dataChange": BOOLEAN,
+                (tags_field()),
+            },
+        };
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_sidecar_schema() {
+        let schema = Sidecar::to_schema();
+        let expected = schema! {
+            not_null "path": STRING,
+            not_null "sizeInBytes": LONG,
+            not_null "modificationTime": LONG,
+            (tags_field()),
+        };
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_checkpoint_metadata_schema() {
+        let schema = get_all_actions_schema()
+            .project(&[CHECKPOINT_METADATA_NAME])
+            .expect("Couldn't get checkpointMetadata field");
+        let expected = schema_ref! {
+            nullable "checkpointMetadata": {
+                not_null "version": LONG,
+                (tags_field()),
+            },
+        };
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_transaction_schema() {
+        let schema = get_commit_schema()
+            .project(&["txn"])
+            .expect("Couldn't get transaction field");
+
+        let expected = schema_ref! {
+            nullable "txn": {
+                not_null "appId": STRING,
+                not_null "version": LONG,
+                nullable "lastUpdated": LONG,
+            },
+        };
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_commit_info_schema() {
+        let schema = get_commit_schema()
+            .project(&["commitInfo"])
+            .expect("Couldn't get commitInfo field");
+
+        let expected = schema_ref! {
+            nullable "commitInfo": {
+                nullable "timestamp": LONG,
+                nullable "inCommitTimestamp": LONG,
+                nullable "operation": STRING,
+                nullable "operationParameters": { STRING => nullable STRING },
+                nullable "operationMetrics": { STRING => nullable STRING },
+                nullable "kernelVersion": STRING,
+                nullable "isBlindAppend": BOOLEAN,
+                nullable "engineInfo": STRING,
+                nullable "txnId": STRING,
+            },
+        };
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_domain_metadata_schema() {
+        let schema = get_commit_schema()
+            .project(&[DOMAIN_METADATA_NAME])
+            .expect("Couldn't get domainMetadata field");
+        let expected = schema_ref! {
+            nullable "domainMetadata": {
+                not_null "domain": STRING,
+                not_null "configuration": STRING,
+                not_null "removed": BOOLEAN,
+            },
+        };
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_validate_protocol() {
+        let invalid_protocols = [
+            Protocol {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                reader_features: None,
+                writer_features: Some(vec![]),
+            },
+            Protocol {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                reader_features: Some(vec![]),
+                writer_features: None,
+            },
+            Protocol {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                reader_features: None,
+                writer_features: None,
+            },
+        ];
+        for Protocol {
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        } in invalid_protocols
+        {
+            assert!(matches!(
+                Protocol::try_new(
+                    min_reader_version,
+                    min_writer_version,
+                    reader_features,
+                    writer_features
+                ),
+                Err(Error::InvalidProtocol(_)),
+            ));
+        }
+    }
+
+    #[rstest]
+    #[case(0, 1)]
+    #[case(1, 0)]
+    #[case(-1, 2)]
+    #[case(1, -1)]
+    fn reject_protocol_version_below_minimum(#[case] rv: i32, #[case] wv: i32) {
+        let expected = if rv < 1 {
+            format!("Invalid protocol action in the delta log: min_reader_version must be >= 1, got {rv}")
+        } else {
+            format!("Invalid protocol action in the delta log: min_writer_version must be >= 1, got {wv}")
+        };
+        assert_result_error_with_message(
+            Protocol::try_new(rv, wv, TableFeature::NO_LIST, TableFeature::NO_LIST),
+            &expected,
+        );
+    }
+
+    #[test]
+    fn accept_min_versions() {
+        let p = Protocol::try_new_legacy(1, 1).unwrap();
+        assert_eq!(p.min_reader_version(), 1);
+        assert_eq!(p.min_writer_version(), 1);
+    }
+
+    #[test]
+    fn test_validate_table_features_invalid() {
+        // (reader_feature, writer_feature)
+        let invalid_features = [
+            // ReaderWriter feature not present in writer features
+            (
+                vec![TableFeature::DeletionVectors],
+                vec![TableFeature::AppendOnly],
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+            ),
+            (
+                vec![TableFeature::DeletionVectors],
+                vec![],
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+            ),
+            // ReaderWriter feature not present in reader features
+            (
+                vec![],
+                vec![TableFeature::DeletionVectors],
+                "Writer features must be Writer-only or also listed in reader features",
+            ),
+            (
+                vec![TableFeature::VariantType],
+                vec![
+                    TableFeature::VariantType,
+                    TableFeature::DeletionVectors,
+                ],
+                "Writer features must be Writer-only or also listed in reader features",
+            ),
+            // WriterOnly feature present in reader features
+            (
+                vec![TableFeature::AppendOnly],
+                vec![TableFeature::AppendOnly],
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+            ),
+        ];
+
+        for (reader_features, writer_features, error_msg) in invalid_features {
+            let res = Protocol::try_new_modern(reader_features, writer_features);
+            // The error message is enriched with the offending feature and the parsed
+            // feature lists, so match on a prefix rather than the whole string.
+            assert!(
+                matches!(
+                    &res,
+                    Err(Error::InvalidProtocol(error)) if error.to_string().contains(error_msg)
+                ),
+                "Expected message containing:\t{error_msg}\nBut got:{res:?}\n"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_table_features_unknown() {
+        // Unknown features are allowed during validation for forward compatibility,
+        // but will be rejected when trying to use the protocol (ensure_operation_supported)
+
+        // Test unknown features in reader - validation passes
+        let protocol = Protocol::try_new_modern(
+            vec![TableFeature::Unknown("unknown_reader".to_string())],
+            vec![TableFeature::Unknown("unknown_reader".to_string())],
+        );
+        assert!(protocol.is_ok());
+
+        // Test unknown features in writer - validation passes
+        let protocol = Protocol::try_new_modern(
+            TableFeature::EMPTY_LIST,
+            vec![TableFeature::Unknown("unknown_writer".to_string())],
+        );
+        assert!(protocol.is_ok());
+    }
+
+    #[test]
+    fn test_validate_table_features_valid() {
+        // (reader_feature, writer_feature)
+        let valid_features = [
+            // ReaderWriter feature present in both reader/writer features,
+            // WriterOnly feature present in writer feature
+            (
+                vec![TableFeature::DeletionVectors],
+                vec![TableFeature::DeletionVectors],
+            ),
+            (vec![], vec![TableFeature::AppendOnly]),
+            (
+                vec![TableFeature::VariantType],
+                vec![TableFeature::VariantType, TableFeature::AppendOnly],
+            ),
+            // Unknown feature may be ReaderWriter or WriterOnly (for forward compatibility)
+            (
+                vec![TableFeature::Unknown("rw".to_string())],
+                vec![
+                    TableFeature::Unknown("rw".to_string()),
+                    TableFeature::Unknown("w".to_string()),
+                ],
+            ),
+            // Empty feature set is valid
+            (vec![], vec![]),
+        ];
+
+        for (reader_features, writer_features) in valid_features {
+            assert!(Protocol::try_new_modern(reader_features, writer_features).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_legacy_column_mapping_valid() {
+        // Valid: ColumnMapping with reader v2
+        // Reader version 2 implies columnMapping support (no explicit reader_features)
+        // Writer version 7 requires explicit writer_features list
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::ColumnMapping]),
+        );
+        assert!(protocol.is_ok());
+    }
+
+    #[test]
+    fn test_validate_legacy_writer_only_features_valid() {
+        // Valid: Writer-only features with reader v1
+        let protocol = Protocol::try_new(
+            1,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::AppendOnly]),
+        );
+        assert!(protocol.is_ok());
+    }
+
+    #[test]
+    fn test_validate_legacy_column_mapping_with_writer_features_valid() {
+        // Valid: Mix of Writer-only and ColumnMapping with reader v2
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::AppendOnly, TableFeature::ColumnMapping]),
+        );
+        assert!(protocol.is_ok());
+    }
+
+    #[test]
+    fn test_validate_column_mapping_reader_v1_invalid() {
+        // Invalid: ColumnMapping with reader v1
+        // Reader v1 doesn't imply any ReaderWriter features
+        let protocol = Protocol::try_new(
+            1,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![TableFeature::ColumnMapping]),
+        );
+        assert!(protocol.is_err());
+    }
+
+    #[test]
+    fn test_validate_multiple_readerwriter_features_reader_v2_invalid() {
+        // Invalid: Multiple ReaderWriter features with reader v2
+        // Only ColumnMapping alone is allowed with reader v2
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            TableFeature::NO_LIST,
+            Some(vec![
+                TableFeature::ColumnMapping,
+                TableFeature::DeletionVectors,
+            ]),
+        );
+        assert!(protocol.is_err());
+    }
+
+    #[test]
+    fn test_parse_table_feature_never_fails() {
+        // weird strs
+        let features = Some(["", "absurD_)(+13%^⚙️"]);
+        let expected = Some(FromIterator::from_iter([
+            TableFeature::unknown(""),
+            TableFeature::unknown("absurD_)(+13%^⚙️"),
+        ]));
+        assert_eq!(parse_features(features), expected);
+    }
+
+    #[test]
+    fn test_into_engine_data() {
+        let engine = ExprEngine::new();
+
+        let set_transaction = SetTransaction {
+            app_id: "app_id".to_string(),
+            version: 0,
+            last_updated: None,
+        };
+
+        let engine_data =
+            set_transaction.into_engine_data(SetTransaction::to_schema().into(), &engine);
+        let record_batch = engine_data.try_into_record_batch().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("appId", ArrowDataType::Utf8, false),
+            Field::new("version", ArrowDataType::Int64, false),
+            Field::new("lastUpdated", ArrowDataType::Int64, true),
+        ]));
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["app_id"])),
+                Arc::new(Int64Array::from(vec![0_i64])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_commit_info_into_engine_data() {
+        let engine = ExprEngine::new();
+
+        let commit_info = CommitInfo::new(0, None, None, None, false);
+        let commit_info_txn_id = commit_info.txn_id.clone();
+
+        let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
+        let record_batch = engine_data.try_into_record_batch().unwrap();
+
+        let mut map_builder = create_string_map_builder(true);
+        map_builder.append(true).unwrap();
+        let operation_parameters = Arc::new(map_builder.finish());
+        let mut map_builder = create_string_map_builder(true);
+        map_builder.append(false).unwrap();
+        let operation_metrics = Arc::new(map_builder.finish());
+
+        let expected = RecordBatch::try_new(
+            record_batch.schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(0)])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
+                operation_parameters,
+                operation_metrics,
+                Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
+                Arc::new(BooleanArray::from(vec![None::<bool>])),
+                Arc::new(StringArray::from(vec![None::<String>])),
+                Arc::new(StringArray::from(vec![commit_info_txn_id])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_domain_metadata_into_engine_data() {
+        let engine = ExprEngine::new();
+
+        let domain_metadata = DomainMetadata {
+            domain: "my.domain".to_string(),
+            configuration: "config_value".to_string(),
+            removed: false,
+        };
+
+        let engine_data =
+            domain_metadata.into_engine_data(DomainMetadata::to_schema().into(), &engine);
+        let record_batch = engine_data.try_into_record_batch().unwrap();
+
+        let expected = RecordBatch::try_new(
+            record_batch.schema(),
+            vec![
+                Arc::new(StringArray::from(vec!["my.domain"])),
+                Arc::new(StringArray::from(vec!["config_value"])),
+                Arc::new(BooleanArray::from(vec![false])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_metadata_try_new() {
+        let schema = schema_ref! { not_null "id": INTEGER };
+        let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
+
+        let metadata = Metadata::try_new(
+            Some("test_table".to_string()),
+            Some("description".to_string()),
+            schema.clone(),
+            vec!["year".to_string()],
+            1234567890,
+            config.clone(),
+        )
+        .unwrap();
+
+        assert!(!metadata.id.is_empty());
+        assert_eq!(metadata.name, Some("test_table".to_string()));
+        assert_eq!(
+            metadata.schema_string,
+            serde_json::to_string(&schema).unwrap()
+        );
+        assert_eq!(metadata.created_time, Some(1234567890));
+        assert_eq!(metadata.configuration, config);
+    }
+
+    #[test]
+    fn test_metadata_try_new_default() {
+        let schema = schema_ref! { not_null "id": INTEGER };
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+
+        assert!(!metadata.id.is_empty());
+        assert_eq!(metadata.name, None);
+        assert_eq!(metadata.description, None);
+    }
+
+    #[test]
+    fn test_metadata_unique_ids() {
+        let schema = schema_ref! { not_null "id": INTEGER };
+        let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
+        let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        assert_ne!(m1.id, m2.id);
+    }
+
+    #[rstest]
+    #[case::typical(HashMap::from([
+        ("path".to_string(), "/delta/table".to_string()),
+        ("compressionType".to_string(), "snappy".to_string()),
+    ]))]
+    #[case::empty(HashMap::new())]
+    #[case::special_characters(HashMap::from([
+        ("path".to_string(), "/path/with spaces".to_string()),
+        ("unicode".to_string(), "测试🎉".to_string()),
+        ("empty".to_string(), String::new()),
+    ]))]
+    fn test_format_scalar_round_trip(#[case] options: HashMap<String, String>) {
+        let format = Format {
+            provider: "parquet".to_string(),
+            options: options.clone(),
+        };
+        let scalar = Scalar::from(format.clone());
+
+        let Scalar::Struct(struct_data) = &scalar else {
+            panic!("Expected struct scalar, got {scalar}");
+        };
+        let field_names: Vec<_> = struct_data.fields().iter().map(|f| f.name()).collect();
+        assert_eq!(field_names, ["provider", "options"]);
+        assert_eq!(struct_data.values()[0], Scalar::from("parquet"));
+
+        let Scalar::Map(map_data) = &struct_data.values()[1] else {
+            panic!("Expected map options");
+        };
+        assert_eq!(map_data.pairs().len(), options.len());
+
+        assert_eq!(Format::try_from(scalar).unwrap(), format);
+    }
+
+    #[test]
+    fn test_format_default() {
+        let format = Format::default();
+        let expected = Format {
+            provider: "parquet".to_string(),
+            options: HashMap::new(),
+        };
+        assert_eq!(format, expected);
+    }
+
+    #[test]
+    fn test_metadata_into_engine_data() {
+        let engine = ExprEngine::new();
+        let schema = schema_ref! { not_null "id": INTEGER };
+
+        let test_metadata = Metadata::try_new(
+            Some("test".to_string()),
+            Some("my table".to_string()),
+            schema.clone(),
+            vec!["part".to_string()],
+            123,
+            HashMap::from([("k".to_string(), "v".to_string())]),
+        )
+        .unwrap();
+
+        // have to get the id since it's random
+        let test_id = test_metadata.id.clone();
+        let actual = test_metadata
+            .into_engine_data(Metadata::to_schema().into(), &engine)
+            .unwrap()
+            .try_into_record_batch()
+            .unwrap();
+
+        let expected_json = json!({
+            "id": test_id,
+            "name": "test",
+            "description": "my table",
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+            "partitionColumns": ["part"],
+            "createdTime": 123,
+            "configuration": {
+                "k": "v"
+            }
+        }).to_string();
+        let expected = ReaderBuilder::new(actual.schema())
+            .build(expected_json.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_metadata_with_log_schema() {
+        let engine = ExprEngine::new();
+        let schema = schema_ref! { not_null "id": INTEGER };
+
+        let metadata = Metadata::try_new(
+            Some("table".to_string()),
+            None, // test that omitting description will omit entire field
+            schema,
+            vec![],
+            456,
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let metadata_id = metadata.id.clone();
+
+        // test with the full log schema that wraps metadata in a "metaData" field
+        let commit_schema = LOG_METADATA_SCHEMA.clone();
+        let actual = metadata
+            .into_engine_data(commit_schema, &engine)
+            .unwrap()
+            .try_into_record_batch()
+            .unwrap();
+
+        let expected_json = json!({
+            "metaData": {
+                "id": metadata_id,
+                "name": "table",
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "createdTime": 456,
+                "configuration": {}
+            }
+        }).to_string();
+        let expected = ReaderBuilder::new(actual.schema())
+            .build(expected_json.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_protocol_into_engine_data() {
+        let engine = ExprEngine::new();
+        let protocol = Protocol::try_new_modern(
+            [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
+            [TableFeature::DeletionVectors, TableFeature::ColumnMapping],
+        )
+        .unwrap();
+
+        let engine_data = protocol
+            .clone()
+            .into_engine_data(Protocol::to_schema().into(), &engine);
+        let record_batch = engine_data.try_into_record_batch().unwrap();
+
+        let list_field = Arc::new(Field::new("element", ArrowDataType::Utf8, false));
+        let protocol_fields = vec![
+            Field::new("minReaderVersion", ArrowDataType::Int32, false),
+            Field::new("minWriterVersion", ArrowDataType::Int32, false),
+            Field::new(
+                "readerFeatures",
+                ArrowDataType::List(list_field.clone()),
+                true, // nullable
+            ),
+            Field::new(
+                "writerFeatures",
+                ArrowDataType::List(list_field.clone()),
+                true, // nullable
+            ),
+        ];
+        let schema = Arc::new(Schema::new(protocol_fields.clone()));
+
+        let string_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
+        list_builder.values().append_value("deletionVectors");
+        list_builder.values().append_value("columnMapping");
+        list_builder.append(true);
+        let reader_features_array = list_builder.finish();
+
+        let string_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
+        list_builder.values().append_value("deletionVectors");
+        list_builder.values().append_value("columnMapping");
+        list_builder.append(true);
+        let writer_features_array = list_builder.finish();
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(reader_features_array.clone()),
+                Arc::new(writer_features_array.clone()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+
+        // test with the full log schema that wraps protocol in a "protocol" field
+        let commit_schema = LOG_PROTOCOL_SCHEMA.clone();
+        let engine_data = protocol.into_engine_data(commit_schema, &engine);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "protocol",
+            ArrowDataType::Struct(protocol_fields.into()),
+            true,
+        )]));
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("minReaderVersion", ArrowDataType::Int32, false)),
+                    Arc::new(Int32Array::from(vec![3])) as Arc<dyn Array>,
+                ),
+                (
+                    Arc::new(Field::new("minWriterVersion", ArrowDataType::Int32, false)),
+                    Arc::new(Int32Array::from(vec![7])) as Arc<dyn Array>,
+                ),
+                (
+                    Arc::new(Field::new(
+                        "readerFeatures",
+                        ArrowDataType::List(list_field.clone()),
+                        true,
+                    )),
+                    Arc::new(reader_features_array) as Arc<dyn Array>,
+                ),
+                (
+                    Arc::new(Field::new(
+                        "writerFeatures",
+                        ArrowDataType::List(list_field),
+                        true,
+                    )),
+                    Arc::new(writer_features_array) as Arc<dyn Array>,
+                ),
+            ]))],
+        )
+        .unwrap();
+
+        let record_batch = engine_data.try_into_record_batch().unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_protocol_into_engine_data_empty_features() {
+        let engine = ExprEngine::new();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
+
+        let engine_data = protocol
+            .into_engine_data(Protocol::to_schema().into(), &engine)
+            .unwrap();
+        let record_batch = engine_data.try_into_record_batch().unwrap();
+
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(record_batch.num_columns(), 4);
+
+        // reader/writer features are Some([]) lists
+        let reader_features_col = record_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(reader_features_col.len(), 1);
+        assert_eq!(reader_features_col.value(0).len(), 0); // empty list
+        let writer_features_col = record_batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(writer_features_col.len(), 1);
+        assert_eq!(writer_features_col.value(0).len(), 0); // empty list
+    }
+
+    #[test]
+    fn test_protocol_into_engine_data_no_features() {
+        let engine = ExprEngine::new();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+
+        let engine_data = protocol
+            .into_engine_data(Protocol::to_schema().into(), &engine)
+            .unwrap();
+        let record_batch = engine_data.try_into_record_batch().unwrap();
+
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(record_batch.num_columns(), 4);
+
+        // reader/writer features are null
+        assert!(record_batch.column(2).is_null(0));
+        assert!(record_batch.column(3).is_null(0));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_add() {
+        let schema = get_commit_schema()
+            .project(&[ADD_NAME, PROTOCOL_NAME])
+            .unwrap();
+        assert!(schema_contains_file_actions(&schema));
+        assert!(schema_contains_file_actions(
+            &schema.project(&[ADD_NAME]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_remove() {
+        let schema = get_commit_schema()
+            .project(&[REMOVE_NAME, METADATA_NAME])
+            .unwrap();
+        assert!(schema_contains_file_actions(&schema));
+        assert!(schema_contains_file_actions(
+            &schema.project(&[REMOVE_NAME]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_both() {
+        let schema = get_commit_schema()
+            .project(&[ADD_NAME, REMOVE_NAME])
+            .unwrap();
+        assert!(schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_neither() {
+        let schema = get_commit_schema()
+            .project(&[PROTOCOL_NAME, METADATA_NAME])
+            .unwrap();
+        assert!(!schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_empty_schema() {
+        let schema = schema_ref! {};
+        assert!(!schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_add_tags_deserialization_null_case() {
+        let json1 = r#"{"path":"file1.parquet","partitionValues":{},"size":100,"modificationTime":1234567890,"dataChange":true,"tags":null}"#;
+        let add1: Add = serde_json::from_str(json1).unwrap();
+        assert_eq!(add1.tags, None);
+    }
+
+    #[test]
+    fn test_add_tags_deserialization_nullable_values_case() {
+        let json2 = r#"{"path":"file2.parquet","partitionValues":{},"size":200,"modificationTime":1234567890,"dataChange":true,"tags":{"INSERTION_TIME":"1677811178336000","NULLABLE_TAG":null}}"#;
+        let add2: Add = serde_json::from_str(json2).unwrap();
+        assert!(add2.tags.is_some());
+        let tags = add2.tags.unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(
+            tags.get("INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
+        assert_eq!(tags.get("NULLABLE_TAG"), Some(&None));
+    }
+
+    #[test]
+    fn test_add_tags_deserialization_non_null_values_case() {
+        let json3 = r#"{"path":"file3.parquet","partitionValues":{},"size":300,"modificationTime":1234567890,"dataChange":true,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000"}}"#;
+        let add3: Add = serde_json::from_str(json3).unwrap();
+        assert!(add3.tags.is_some());
+        let tags = add3.tags.unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(
+            tags.get("INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
+        assert_eq!(
+            tags.get("MIN_INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_schema() {
+        let schema = get_commit_schema()
+            .project(&[CHECKPOINT_ACTION_NAME])
+            .unwrap();
+
+        // The `checkpoint` action serializes as an array whose elements are a union of the
+        // embedded metadata actions.
+        let checkpoint_field = schema.field(CHECKPOINT_ACTION_NAME).unwrap();
+        assert!(checkpoint_field.is_nullable());
+        let array = match checkpoint_field.data_type() {
+            DataType::Array(array) => array,
+            other => panic!("Expected array, got {other:?}"),
+        };
+        assert!(!array.contains_null());
+        let element = match array.element_type() {
+            DataType::Struct(s) => s,
+            other => panic!("Expected struct element, got {other:?}"),
+        };
+        let field_names: Vec<&str> = element.fields().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec![
+                CHECKPOINT_METADATA_NAME,
+                CONTENT_ROOT_NAME,
+                PROTOCOL_NAME,
+                METADATA_NAME,
+                DOMAIN_METADATA_NAME,
+                SET_TRANSACTION_NAME,
+                SIDECAR_NAME,
+            ]
+        );
+        // `commitInfo` must NOT be a checkpoint-array element; the RFC routes it to the top-level
+        // Delta log.
+        assert!(!field_names.contains(&COMMIT_INFO_NAME));
+
+        // Every element type is an optional (union member) struct.
+        for field in element.fields() {
+            assert!(field.is_nullable(), "{} should be nullable", field.name);
+            assert!(matches!(field.data_type(), DataType::Struct(_)));
+        }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_content_sidecar_is_type_prefixed_sidecar() {
+        // The content-sidecar schema is composed from `Sidecar::to_schema()` with a `type`
+        // discriminator prepended, so it must equal exactly `type` followed by `Sidecar`'s fields.
+        let DataType::Struct(content_sidecar) = CONTENT_SIDECAR_FIELD.data_type() else {
+            panic!("content sidecar should be a struct");
+        };
+        let expected: Vec<StructField> =
+            std::iter::once(StructField::not_null("type", DataType::STRING))
+                .chain(Sidecar::to_schema().into_fields())
+                .collect();
+        let actual: Vec<StructField> = content_sidecar.fields().cloned().collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[rstest]
+    #[case::relative_path(
+        "memory:///table/",
+        "metadata/root.parquet",
+        2048,
+        "memory:///table/metadata/root.parquet",
+        Ok(2048)
+    )]
+    #[case::absolute_path(
+        "memory:///table/",
+        "s3://bucket/table/metadata/root.parquet",
+        2048,
+        "s3://bucket/table/metadata/root.parquet",
+        Ok(2048)
+    )]
+    #[case::negative_size(
+        "memory:///table/",
+        "metadata/root.parquet",
+        -1,
+        "memory:///table/metadata/root.parquet",
+        Err("Failed to convert checkpoint contentRoot size -1")
+    )]
+    #[case::table_root_without_trailing_slash_gets_one(
+        "memory:///table",
+        "metadata/root.parquet",
+        2048,
+        "memory:///table/metadata/root.parquet",
+        Ok(2048)
+    )]
+    #[case::single_char_scheme_treated_as_absolute(
+        "memory:///table/",
+        "c:/foo/root.parquet",
+        2048,
+        "c:/foo/root.parquet",
+        Ok(2048)
+    )]
+    // A colon inside a relative path segment is not a scheme delimiter (a `/` precedes it), so
+    // the path stays relative.
+    #[case::colon_in_relative_segment_stays_relative(
+        "memory:///table/",
+        "metadata/snap-123:456.parquet",
+        2048,
+        "memory:///table/metadata/snap-123:456.parquet",
+        Ok(2048)
+    )]
+    // RFC 3986 requires the first scheme char to be ALPHA; a leading digit is not a scheme.
+    #[case::leading_digit_scheme_treated_as_relative(
+        "memory:///table/",
+        "3com/root.parquet",
+        2048,
+        "memory:///table/3com/root.parquet",
+        Ok(2048)
+    )]
+    // A non-ASCII leading letter (Greek alpha, U+03B1) is not a valid scheme char.
+    #[case::non_ascii_scheme_treated_as_relative(
+        "memory:///table/",
+        "\u{03b1}scheme/root.parquet",
+        2048,
+        "memory:///table/%CE%B1scheme/root.parquet",
+        Ok(2048)
+    )]
+    // A multi-char, non-alphanumeric scheme (`git+ssh`) is absolute and used as-is.
+    #[case::compound_scheme_treated_as_absolute(
+        "memory:///table/",
+        "git+ssh://host/repo/root.parquet",
+        2048,
+        "git+ssh://host/repo/root.parquet",
+        Ok(2048)
+    )]
+    fn test_checkpoint_action_root_filemeta(
+        #[case] table_root: &str,
+        #[case] path: &str,
+        #[case] size_in_bytes: i64,
+        #[case] expected_location: &str,
+        #[case] expected: Result<FileSize, &str>,
+    ) {
+        let table_root = Url::parse(table_root).unwrap();
+        let checkpoint_action = CheckpointAction {
+            version: 1,
+            content_root: ContentRoot {
+                path: path.to_string(),
+                size_in_bytes,
+                version: 1,
+            },
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            metadata: Metadata::default(),
+            transactions: Vec::new(),
+            domain_metadata: Vec::new(),
+            txn_sidecars: Vec::new(),
+            domain_metadata_sidecars: Vec::new(),
+        };
+
+        let result = checkpoint_action.root_filemeta(&table_root);
+        match expected {
+            Ok(expected_size) => {
+                let file_meta = result.unwrap();
+                assert_eq!(file_meta.location.as_str(), expected_location);
+                assert_eq!(file_meta.size, expected_size);
+                assert_eq!(file_meta.last_modified, i64::MAX);
+            }
+            Err(expected_message) => assert_result_error_with_message(result, expected_message),
+        }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    fn sample_checkpoint_action() -> CheckpointAction {
+        let sidecar = |path: &str| Sidecar {
+            path: path.to_string(),
+            size_in_bytes: 100,
+            modification_time: 1,
+            tags: None,
+        };
+        CheckpointAction {
+            version: 42,
+            content_root: ContentRoot {
+                path: "s3://bucket/manifest".to_string(),
+                size_in_bytes: 1024,
+                version: 40,
+            },
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            metadata: Metadata::default(),
+            transactions: vec![SetTransaction {
+                app_id: "myApp".to_string(),
+                version: 3,
+                last_updated: None,
+            }],
+            domain_metadata: vec![DomainMetadata {
+                domain: "myDomain".to_string(),
+                configuration: "cfg".to_string(),
+                removed: false,
+            }],
+            txn_sidecars: vec![sidecar("txn-sidecar.parquet")],
+            domain_metadata_sidecars: vec![sidecar("dm-sidecar.parquet")],
+        }
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_into_engine_data_round_trip() -> DeltaResult<()> {
+        let engine = ExprEngine::new();
+        let action = sample_checkpoint_action();
+        let data = action
+            .clone()
+            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let back = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should round-trip");
+        assert_eq!(action, back);
+        Ok(())
+    }
+
+    // The `contentRoot.version <= checkpointMetadata.version` invariant is enforced on the
+    // serialize path too, not just when parsing. `content_root_version_too_high` in visitors.rs
+    // covers the parse-path guard; this covers the `validate()` call inside `into_engine_data`.
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_into_engine_data_rejects_invalid_content_root_version() {
+        let base = sample_checkpoint_action();
+        let action = CheckpointAction {
+            content_root: ContentRoot {
+                version: base.version + 1,
+                ..base.content_root
+            },
+            ..sample_checkpoint_action()
+        };
+        let engine = ExprEngine::new();
+        let result = action.into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine);
+        assert_result_error_with_message(result, "exceeds checkpointMetadata.version");
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_wire_format() -> DeltaResult<()> {
+        use crate::engine::to_json_bytes;
+        use crate::engine_data::FilteredEngineData;
+
+        // Build the action's engine data, then write it out through the engine JSON writer and
+        // pin the exact bytes. This is the only guard on the wire format: element order, camelCase
+        // field names, the sidecar `type` discriminator, and the JSON writer's null omission (the
+        // null union siblings collapse each element to a single-key tagged object).
+        let engine = ExprEngine::new();
+        let data =
+            sample_checkpoint_action().into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let filtered = FilteredEngineData::with_all_rows_selected(data);
+        let bytes = to_json_bytes(std::iter::once(Ok(filtered)))?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            json,
+            json!({ "checkpoint": [
+                { "checkpointMetadata": { "version": 42 } },
+                { "contentRoot": { "path": "s3://bucket/manifest", "sizeInBytes": 1024, "version": 40 } },
+                { "protocol": { "minReaderVersion": 1, "minWriterVersion": 2 } },
+                { "metaData": {
+                    "id": "",
+                    "format": { "provider": "parquet", "options": {} },
+                    "schemaString": "",
+                    "partitionColumns": [],
+                    "configuration": {},
+                } },
+                { "txn": { "appId": "myApp", "version": 3 } },
+                { "domainMetadata": { "domain": "myDomain", "configuration": "cfg", "removed": false } },
+                { "sidecar": { "type": "txn", "path": "txn-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1 } },
+                { "sidecar": { "type": "domainMetadata", "path": "dm-sidecar.parquet", "sizeInBytes": 100, "modificationTime": 1 } },
+            ] })
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_try_new_from_data_returns_none_when_no_checkpoint_action() -> DeltaResult<()> {
+        // `action_batch` carries many action kinds but no `checkpoint` array, so parsing yields
+        // `Ok(None)` rather than an error.
+        let data = crate::unit_test_utils::action_batch();
+        assert!(CheckpointAction::try_new_from_data(data.as_ref())?.is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_round_trip_multiple_and_empty_collections() -> DeltaResult<()> {
+        // Exercise the write loops and the reader's accumulation for count > 1 (two txns, two
+        // domainMetadata, two same-type sidecars) and count 0 (empty domainMetadata sidecars).
+        let sidecar = |path: &str| Sidecar {
+            path: path.to_string(),
+            size_in_bytes: 1,
+            modification_time: 2,
+            tags: None,
+        };
+        let action = CheckpointAction {
+            version: 10,
+            content_root: ContentRoot {
+                path: "s3://bucket/manifest".to_string(),
+                size_in_bytes: 8,
+                version: 8,
+            },
+            protocol: Protocol::new_unchecked(1, 2, None, None),
+            metadata: Metadata::default(),
+            transactions: vec![
+                SetTransaction {
+                    app_id: "a1".to_string(),
+                    version: 1,
+                    last_updated: None,
+                },
+                SetTransaction {
+                    app_id: "a2".to_string(),
+                    version: 2,
+                    last_updated: None,
+                },
+            ],
+            domain_metadata: vec![
+                DomainMetadata {
+                    domain: "d1".to_string(),
+                    configuration: "c1".to_string(),
+                    removed: false,
+                },
+                DomainMetadata {
+                    domain: "d2".to_string(),
+                    configuration: "c2".to_string(),
+                    removed: true,
+                },
+            ],
+            txn_sidecars: vec![sidecar("t1.parquet"), sidecar("t2.parquet")],
+            domain_metadata_sidecars: vec![],
+        };
+        let engine = ExprEngine::new();
+        let data = action
+            .clone()
+            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let back = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should round-trip");
+        assert_eq!(action, back);
+        Ok(())
+    }
+
+    #[cfg(feature = "adaptive-metadata-in-dev")]
+    #[test]
+    fn test_checkpoint_action_round_trip_protocol_with_features() -> DeltaResult<()> {
+        // A (3, 7) protocol with the same ReaderWriter feature in both lists (required by the
+        // read-time feature-consistency check) must survive `into_engine_data` -> parse.
+        let action = CheckpointAction {
+            protocol: Protocol::new_unchecked(
+                3,
+                7,
+                Some(vec![TableFeature::AdaptiveMetadataPreview]),
+                Some(vec![TableFeature::AdaptiveMetadataPreview]),
+            ),
+            ..sample_checkpoint_action()
+        };
+        let engine = ExprEngine::new();
+        let data = action
+            .clone()
+            .into_engine_data(LOG_CHECKPOINT_SCHEMA.clone(), &engine)?;
+        let back = CheckpointAction::try_new_from_data(data.as_ref())?
+            .expect("checkpoint action should round-trip");
+        assert_eq!(action, back);
+        Ok(())
+    }
+}

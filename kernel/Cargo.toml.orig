@@ -1,0 +1,199 @@
+[package]
+name = "buoyant_kernel"
+description = "Buoyant Data distribution of delta-kernel"
+documentation = "https://docs.rs/buoyant_kernel"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+version.workspace = true
+# exclude golden tests + golden test data since they push us over 10MB crate size limit
+# also exlude tests/data since similarly this has large test tables we don't need to ship
+exclude = ["tests/golden_tables.rs", "tests/golden_data/", "tests/data/"]
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+# for cargo-release
+[package.metadata.release]
+pre-release-replacements = [
+  { file = "../README.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
+  { file = "../README.md", search = "version = \"[a-z0-9\\.-]+\"", replace = "version = \"{{version}}\"" },
+]
+pre-release-hook = [
+  "git",
+  "cliff",
+  "--repository",
+  "../",
+  "--config",
+  "../cliff.toml",
+  "--unreleased",
+  "--prepend",
+  "../CHANGELOG.md",
+  "--include-path",
+  "*",
+  "--tag",
+  "{{version}}",
+]
+
+[dependencies]
+delta_kernel_derive = { package = "buoyant_kernel_derive", path = "../derive-macros", version = "1.2"}
+bytes = "1.10"
+chrono = "0.4.41"
+crc = "3.2.2"
+indexmap = "2.10.0"
+itertools = "0.14"
+percent-encoding = "2"
+rand = "0.9"
+roaring = "0.11.2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+strum = { version = "0.28", features = ["derive"] }
+thiserror = "2"
+prost = { version = "0.13", optional = true }
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = "0.3"
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
+z85 = "3.0.6"
+
+# optional deps
+# `reqwest` is only needed for the gated `Error::Reqwest` variant; the actual HTTP client
+# lives in the `delta_kernel_default_engine` crate now.
+reqwest = { version = "0.13", default-features = false, optional = true }
+# both arrow versions below are optional and require object_store
+object_store_13 = { package = "object_store", version = "0.13.2", optional = true, features = ["aws", "azure", "gcp", "http"] }
+
+# arrow 58
+[dependencies.arrow_58]
+package = "arrow"
+version = "58"
+features = ["chrono-tz", "ffi", "json"]
+optional = true
+[dependencies.parquet_58]
+package = "parquet"
+version = "58.1"
+features = ["async", "object_store"]
+optional = true
+
+# arrow 59
+[dependencies.arrow_59]
+package = "arrow"
+version = "59"
+features = ["chrono-tz", "ffi", "json"]
+optional = true
+[dependencies.parquet_59]
+package = "parquet"
+version = "59"
+features = ["async", "object_store"]
+optional = true
+
+[features]
+# no default features
+default = []
+# internal-api will make everything marked #[internal_api] public.
+internal-api = []
+# prettyprint enables Arrow pretty-print helpers (test/example oriented).
+prettyprint = ["arrow_58?/prettyprint", "arrow_59?/prettyprint"]
+# test-utils exposes test-only constructors for downstream crate tests
+test-utils = ["prettyprint"]
+# integration-test turns on a particularly heavy test for hdfs-object-store
+integration-test = ["hdfs-native-object-store/integration-test"]
+
+# The default versions for arrow/parquet/object_store
+arrow = ["arrow-59"] # latest arrow version
+need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
+
+arrow-58 = ["dep:arrow_58", "dep:parquet_58", "dep:object_store_13"]
+arrow-59 = ["dep:arrow_59", "dep:parquet_59", "dep:object_store_13"]
+arrow-conversion = ["need-arrow"]
+arrow-expression = ["need-arrow"]
+
+# Schema diffing functionality (experimental)
+schema-diff = []
+
+# Declarative plan IR (experimental).
+declarative-plans = ["internal-api", "dep:prost", "dep:prost-build"]
+
+# Sources a prebuilt `protoc` for the codegen `declarative-plans` runs, so the build needs no
+# system protobuf install. Leave it off to pass `protoc` through the `PROTOC` env var instead;
+# a build that pins a hermetic toolchain cannot use a downloaded binary.
+vendored-protoc = ["dep:protoc-bin-vendored"]
+
+# Experimental, temporary, test-only feature flag guarding the in-progress check-constraints
+# work: the SQL predicate parser and, later, `checkConstraints` write enforcement. Remove once
+# full check-constraints support ships.
+check-constraints-in-dev = []
+# Experimental, temporary, test-only feature flag guarding the in-progress adaptiveMetadata
+# (Iceberg V4 adaptive metadata tree) work. TODO(#2866): remove once full support ships.
+adaptive-metadata-in-dev = []
+# Experimental, temporary, test-only feature flag guarding the in-progress geospatial
+# (geometry/geography) type work. TODO(#2949): remove once full geo support ships.
+geo-type-in-dev = []
+# Nanosecond timestamps table feature and primitive types, a preview of
+# corresponding RFC (https://github.com/delta-io/delta/issues/6081).
+nanosecond-timestamps = ["test_utils/nanosecond-timestamps"]
+
+# Enables shared Arrow-based engine support modules (arrow_data, arrow_expression,
+# ensure_data_types, parquet_row_group_skipping). Used by the delta_kernel_default_engine crate
+# and the SyncEngine. Keeps `reqwest` only for the gated `Error::Reqwest` variant.
+default-engine-base = [
+  "arrow-conversion",
+  "arrow-expression",
+  "need-arrow",
+  "reqwest",
+]
+
+[build-dependencies]
+rustc_version = "0.4.1"
+# Proto codegen, only pulled in / run under the `declarative-plans` feature.
+prost-build = { version = "0.13", optional = true }
+# Prebuilt `protoc` for that codegen, only pulled in under the `vendored-protoc` feature.
+protoc-bin-vendored = { version = "3.2", optional = true }
+
+[dev-dependencies]
+delta_kernel = { package = "buoyant_kernel", path = ".", features = ["test-utils"] }
+# NOTE: test_utils forcibly pulls the default engine and arrow-58. By default it ALSO pulls
+# arrow-59, which takes precedence and would make it impossible to test against arrow-58.
+test_utils = { path = "../test-utils", default-features = false }
+# Used by the test-only SyncEngine to drive object_store calls via `futures::executor::block_on`.
+futures = "0.3"
+# Used by integration tests that bridge object_store's async API in test setup.
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
+criterion = "0.5"
+# Used for testing parse_url_opts extensibility
+hdfs-native-object-store = { version = "0.16.0" }
+hdfs-native = "0.13.4"
+walkdir = { version = "2.5.0" }
+async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
+paste = "1.0"
+test-log = { version = "0.2", default-features = false, features = ["trace"] }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "env-filter",
+  "fmt",
+] }
+rstest = "0.23"
+rstest_reuse = "0.7"
+[[bench]]
+name = "metadata_bench"
+harness = false
+
+[[bench]]
+name = "expression_bench"
+harness = false
+
+# Single integration test binary. Linking each integration test as a separate
+# binary is expensive (every binary re-links Arrow, Parquet, and the default
+# engine), so all integration tests share one binary whose entry point is
+# `tests/integration/main.rs` and whose topics live as submodules.
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+# Declare as an example for access to test_utils
+[[example]]
+name = "metrics-tester"
+path = "tests/integration/metrics_main.rs"
